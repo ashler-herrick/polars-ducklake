@@ -38,9 +38,11 @@ from polars_ducklake._catalog import (
     CatalogReader,
     ColumnInfo,
     DataFileInfo,
+    FileColumnStat,
     SchemaInfo,
     TableInfo,
 )
+from polars_ducklake._predicate import extract_clauses, file_can_match
 from polars_ducklake.paths import PathSegment, resolve_path
 from polars_ducklake.types import build_nested_type, is_nested_type, map_type
 
@@ -223,6 +225,7 @@ class _FilePlan:
     ``_ducklake_internal_snapshot_id`` *before* the projection drops it.
     """
 
+    data_file_id: int
     full_path: str
     delete_paths: tuple[str, ...]
     projection: tuple[pl.Expr, ...]
@@ -298,6 +301,7 @@ def _plan_file(
         else:
             exprs.append(pl.col(tc.name))
     return _FilePlan(
+        data_file_id=file.data_file_id,
         full_path=full_path,
         delete_paths=tuple(delete_paths),
         projection=tuple(exprs),
@@ -566,8 +570,16 @@ def _make_generator(
         _batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         r = ctx.resolve()
+        plans = r.per_file_plans
+        if predicate is not None:
+            # Catalog-level pruning: drop whole files whose per-column
+            # min/max in the catalog rule out the predicate. Files we
+            # can't decide on (unsupported predicate, missing stats)
+            # fall through and Polars handles the filter itself.
+            plans = _prune_files_by_stats(ctx, r, plans, predicate)
+
         remaining = n_rows
-        for plan in r.per_file_plans:
+        for plan in plans:
             if remaining is not None and remaining <= 0:
                 return
             lf = plan.build(storage_options=ctx.storage_options)
@@ -588,3 +600,60 @@ def _make_generator(
             yield df
 
     return _gen
+
+
+def _prune_files_by_stats(
+    ctx: _PlanContext,
+    resolved: _Resolved,
+    plans: list[_FilePlan],
+    predicate: pl.Expr,
+) -> list[_FilePlan]:
+    """Drop files whose catalog stats prove the predicate false.
+
+    Returns ``plans`` unchanged when:
+
+    * the predicate isn't a flat AND of supported leaves,
+    * none of the leaf columns are visible in the target schema, or
+    * the catalog has no stats rows for the (file, column) pairs we'd
+      check (e.g. the writer didn't emit them).
+
+    Otherwise, fetches stats once for every (referenced column, file)
+    pair and runs :func:`file_can_match` per file.
+    """
+    clauses = extract_clauses(predicate)
+    if not clauses:
+        return plans
+
+    # Map predicate column names → (column_id, column_type) at the target.
+    target_meta: dict[str, tuple[int, str]] = {
+        tc.name: (tc.column_id, tc.column_type) for tc in resolved.target_columns
+    }
+    referenced_column_ids = {
+        target_meta[c.column][0] for c in clauses if c.column in target_meta
+    }
+    if not referenced_column_ids:
+        # Predicate references only columns that don't exist at the target
+        # snapshot (likely a user mistake — Polars will raise at collect).
+        return plans
+
+    file_ids = [p.data_file_id for p in plans]
+    with CatalogReader.from_metadata_catalog(ctx.metadata_catalog) as reader:
+        stats = reader.fetch_file_stats(
+            data_file_ids=file_ids,
+            column_ids=sorted(referenced_column_ids),
+        )
+
+    # Group stats by data_file_id for the per-file check.
+    by_file: dict[int, dict[int, FileColumnStat]] = defaultdict(dict)
+    for s in stats:
+        by_file[s.data_file_id][s.column_id] = s
+
+    return [
+        p
+        for p in plans
+        if file_can_match(
+            stats_by_column=by_file.get(p.data_file_id, {}),
+            clauses=clauses,
+            column_meta=target_meta,
+        )
+    ]

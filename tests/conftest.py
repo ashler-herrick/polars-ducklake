@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,27 @@ import pytest
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+
+
+def _stat_string(value: Any) -> str:
+    """Stringify a Python value the way DuckLake's stats column expects.
+
+    Mirrors what DuckDB's ducklake writer emits: integers/floats as
+    decimal, strings verbatim, booleans as ``"0"``/``"1"``, dates as
+    ISO ``YYYY-MM-DD``, naive datetimes as ``YYYY-MM-DD HH:MM:SS[.ffffff]``.
+    """
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        # Naive only — tests don't currently exercise tz-aware stats.
+        return value.isoformat(sep=" ", timespec="microseconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    raise ValueError(f"don't know how to stringify {type(value).__name__}")
 
 
 class DuckLakeBuilder:
@@ -205,6 +226,20 @@ class DuckLakeBuilder:
                 partial_max BIGINT
             )
             """,
+            """
+            CREATE TABLE ducklake_file_column_stats (
+                data_file_id BIGINT NOT NULL,
+                table_id BIGINT NOT NULL,
+                column_id BIGINT NOT NULL,
+                column_size_bytes BIGINT,
+                value_count BIGINT,
+                null_count BIGINT,
+                min_value VARCHAR(1024),
+                max_value VARCHAR(1024),
+                contains_nan BIGINT,
+                extra_stats VARCHAR(1024)
+            )
+            """,
             # ``key`` is reserved in MySQL — quote it per-dialect.
             f"""
             CREATE TABLE ducklake_metadata (
@@ -369,12 +404,18 @@ class DuckLakeBuilder:
         filename: str | None = None,
         path_is_relative: bool = True,
         partial_max: int | None = None,
+        compute_stats: bool = False,
     ) -> int:
         """Write a Parquet data file and register it in ducklake_data_file.
 
         ``partial_max`` simulates a compaction-merged file. When set, the
         DataFrame must already include a ``_ducklake_internal_snapshot_id``
         column carrying the per-row origin snapshot id.
+
+        ``compute_stats=True`` populates ``ducklake_file_column_stats``
+        with min/max/null counts derived from ``df``. Used for predicate-
+        pruning tests; left off by default so existing fixtures stay
+        focused on whatever they're testing.
         """
         self._data_file_counter += 1
         data_file_id = self._data_file_counter
@@ -407,7 +448,66 @@ class DuckLakeBuilder:
                     "pmax": partial_max,
                 },
             )
+        if compute_stats:
+            self._populate_file_column_stats(
+                data_file_id=data_file_id, table_id=table_id, df=df
+            )
         return data_file_id
+
+    def _populate_file_column_stats(
+        self, *, data_file_id: int, table_id: int, df: pl.DataFrame
+    ) -> None:
+        """Insert per-column min/max into ducklake_file_column_stats.
+
+        Looks up the catalog column_id for each DataFrame column; columns
+        the catalog doesn't know about (e.g. _ducklake_internal_snapshot_id
+        on partial files) are skipped silently.
+        """
+        with self._conn() as conn:
+            cols = conn.execute(
+                text(
+                    "SELECT column_id, column_name FROM ducklake_column "
+                    "WHERE table_id = :tid AND parent_column IS NULL"
+                ),
+                {"tid": table_id},
+            ).all()
+        column_id_by_name = {row[1]: row[0] for row in cols}
+        for name in df.columns:
+            column_id = column_id_by_name.get(name)
+            if column_id is None:
+                continue
+            col = df[name]
+            non_null = col.drop_nulls()
+            null_count = int(col.null_count())
+            value_count = int(col.len())
+            if non_null.len() == 0:
+                min_v: str | None = None
+                max_v: str | None = None
+            else:
+                min_v = _stat_string(non_null.min())
+                max_v = _stat_string(non_null.max())
+            with self._conn() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO ducklake_file_column_stats
+                            (data_file_id, table_id, column_id,
+                             value_count, null_count, min_value, max_value,
+                             contains_nan)
+                        VALUES (:dfid, :tid, :cid,
+                                :vc, :nc, :mn, :mx, NULL)
+                        """
+                    ),
+                    {
+                        "dfid": data_file_id,
+                        "tid": table_id,
+                        "cid": column_id,
+                        "vc": value_count,
+                        "nc": null_count,
+                        "mn": min_v,
+                        "mx": max_v,
+                    },
+                )
 
     def expire_data_file(self, *, data_file_id: int, end_snapshot: int) -> None:
         """Mark a data file as no longer visible at and after ``end_snapshot``."""
