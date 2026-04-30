@@ -200,9 +200,12 @@ class TestPushdown:
         builder = multi_file_lake["builder"]
         lf = pdl.scan_ducklake(builder.url, table="events").filter(pl.col("kind") == "a")
         plan = lf.explain()
-        # Polars will push the predicate into the parquet scan; the plan
-        # should not contain a separate FILTER node above the scan.
-        assert "Parquet" in plan or "PARQUET" in plan
+        # The IO plugin shows up as PYTHON SCAN. Predicate pushdown lands
+        # as a SELECTION on that node — the engine hands the deserialized
+        # expression to our generator, which forwards it to the per-file
+        # scan_parquet for actual row-group skipping.
+        assert "PYTHON SCAN" in plan
+        assert "SELECTION:" in plan
         assert "kind" in plan
 
     def test_projection_pushdown_in_plan(self, multi_file_lake: dict[str, Any]) -> None:

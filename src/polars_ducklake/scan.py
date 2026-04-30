@@ -1,30 +1,46 @@
 """The public ``scan_ducklake`` entry point.
 
-This is the only function exported from the package. It wires together
-the catalog-resolution, metadata-query, and path-resolution layers,
-then hands the resolved Parquet path list to :func:`polars.scan_parquet`
-so Polars' native query engine takes over (predicate pushdown, projection
-pushdown, streaming, etc).
+This is the only function exported from the package. It registers the
+DuckLake reader as a Polars IO plugin via :func:`polars.io.plugins.register_io_source`
+and returns a :class:`polars.LazyFrame` whose root operator is a single
+``IO_SOURCE`` node.
 
-The architecture is deliberately minimal: there is no custom IO source,
-no Arrow handoff, and no DuckDB process. Catalog access lives entirely
-in :class:`polars_ducklake._catalog.CatalogReader`; this module focuses
-on translating its results into a Polars LazyFrame.
+At ``scan_ducklake`` call time we eagerly resolve the catalog identity
+(snapshot, schema, table) and refuse inlined-data tables — so users still
+get ``LookupError`` / ``NotImplementedError`` directly from the call.
+Everything heavier — column expansion, file enumeration, delete-file
+linkage, per-file projection planning — is deferred to a memoized
+:class:`_PlanContext` and only runs when Polars asks for the schema or
+drives the read generator. The generator is what receives Polars' pushed
+``with_columns``, ``predicate``, and ``n_rows``, then forwards them into
+per-file ``scan_parquet`` calls.
+
+There is no DuckDB runtime dependency and no Arrow handoff: the file
+reads are pure :func:`polars.scan_parquet` underneath.
 
 See https://ducklake.select/docs/stable/specification/queries for the
-canonical catalog SQL pattern.
+catalog SQL pattern and https://docs.pola.rs/user-guide/plugins/io_plugins
+for the plugin contract.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
+from polars.io.plugins import register_io_source
 
-from polars_ducklake._catalog import CatalogReader, ColumnInfo, DataFileInfo
+from polars_ducklake._catalog import (
+    CatalogReader,
+    ColumnInfo,
+    DataFileInfo,
+    SchemaInfo,
+    TableInfo,
+)
 from polars_ducklake.paths import PathSegment, resolve_path
 from polars_ducklake.types import build_nested_type, is_nested_type, map_type
 
@@ -135,10 +151,13 @@ def scan_ducklake(
     Returns
     -------
     polars.LazyFrame
-        Backed by ``scan_parquet`` over the resolved data-file paths,
-        with positional deletes applied per-file via anti-join and
-        per-file column projections that translate older Parquet schemas
-        into the target snapshot's column layout.
+        A single ``IO_SOURCE`` node registered via
+        :func:`polars.io.plugins.register_io_source`. Polars hands the
+        deserialized predicate, projected columns, and any ``n_rows``
+        limit back to the reader, which forwards them to per-file
+        ``scan_parquet`` calls (with positional deletes applied per-file
+        via anti-join and per-file column projections that translate
+        older Parquet schemas into the target snapshot's column layout).
 
     Raises
     ------
@@ -158,17 +177,36 @@ def scan_ducklake(
 
     schema, table = _resolve_table_identifier(schema=schema, table=table)
 
-    # Pin the snapshot eagerly so the LazyFrame's identity is stable across
-    # later catalog commits and so two scans built from the same call are
-    # interchangeable (relevant once we move to register_io_source's
-    # is_pure=True). Everything else is lazy on _PlanContext.
+    # Eager: resolve identity (snapshot/schema/table) and refuse inlined data.
+    # These are cheap (3-4 small SELECTs) and we keep them eager so the
+    # public exception API stays stable: scan_ducklake() raises LookupError
+    # / NotImplementedError directly, instead of polars wrapping them in
+    # ComputeError at .collect() time. Heavy catalog work (column expansion,
+    # file enumeration, plan construction) is deferred to _PlanContext.
     with CatalogReader.from_metadata_catalog(metadata_catalog) as reader:
         target_snapshot = reader.resolve_snapshot_id(snapshot_id=snapshot_id, as_of=as_of)
+        schema_info = reader.resolve_schema(schema_name=schema, snapshot_id=target_snapshot)
+        table_info = reader.resolve_table(
+            schema_id=schema_info.schema_id,
+            table_name=table,
+            snapshot_id=target_snapshot,
+        )
+        if reader.has_inlined_data(table_id=table_info.table_id):
+            raise NotImplementedError(
+                f"Table {table!r} has inlined data stored directly in the catalog "
+                "(see ducklake_inlined_data_tables). polars-ducklake's scan_ducklake "
+                "is designed for the large-dataset path; inlined-data support is on "
+                "the future-work list. To unblock today, set "
+                "DATA_INLINING_ROW_LIMIT=0 on the catalog or run the writer's "
+                "inline-flush command to materialize inlined rows into Parquet."
+            )
 
     ctx = _PlanContext(
         metadata_catalog=metadata_catalog,
         schema_name=schema,
         table_name=table,
+        schema_info=schema_info,
+        table_info=table_info,
         snapshot_id=target_snapshot,
         storage_options=storage_options,
         data_path=data_path,
@@ -402,6 +440,8 @@ class _PlanContext:
     metadata_catalog: str | Engine
     schema_name: str
     table_name: str
+    schema_info: SchemaInfo
+    table_info: TableInfo
     snapshot_id: int
     storage_options: dict[str, Any] | None
     data_path: str | None
@@ -411,29 +451,8 @@ class _PlanContext:
         if self._resolved is not None:
             return self._resolved
 
+        table_id = self.table_info.table_id
         with CatalogReader.from_metadata_catalog(self.metadata_catalog) as reader:
-            schema_info = reader.resolve_schema(
-                schema_name=self.schema_name, snapshot_id=self.snapshot_id
-            )
-            table_info = reader.resolve_table(
-                schema_id=schema_info.schema_id,
-                table_name=self.table_name,
-                snapshot_id=self.snapshot_id,
-            )
-            table_id = table_info.table_id
-
-            if reader.has_inlined_data(table_id=table_id):
-                raise NotImplementedError(
-                    f"Table {self.table_name!r} has inlined data stored directly "
-                    "in the catalog (see ducklake_inlined_data_tables). "
-                    "polars-ducklake's scan_ducklake is designed for the "
-                    "large-dataset path; inlined-data support is on the "
-                    "future-work list. To unblock today, set "
-                    "DATA_INLINING_ROW_LIMIT=0 on the catalog or run the "
-                    "writer's inline-flush command to materialize inlined "
-                    "rows into Parquet."
-                )
-
             target_columns = _build_target_columns(
                 reader.fetch_columns_with_nested(
                     table_id=table_id, snapshot_id=self.snapshot_id
@@ -452,10 +471,12 @@ class _PlanContext:
             )
 
             schema_segment = PathSegment(
-                path=schema_info.path, is_relative=schema_info.path_is_relative
+                path=self.schema_info.path,
+                is_relative=self.schema_info.path_is_relative,
             )
             table_segment = PathSegment(
-                path=table_info.path, is_relative=table_info.path_is_relative
+                path=self.table_info.path,
+                is_relative=self.table_info.path_is_relative,
             )
 
             def _resolve_path(path: str, path_is_relative: bool) -> str:
@@ -498,29 +519,72 @@ class _PlanContext:
         )
         return self._resolved
 
-    def build_lazyframe(self) -> pl.LazyFrame:
-        """Build the LazyFrame using the current ``pl.concat`` plan shape.
+    def _polars_schema(self) -> pl.Schema:
+        """Schema callable handed to ``register_io_source``.
 
-        Fast path: when every file's schema matches target and no deletes
-        apply, collapse to a single multi-file ``pl.scan_parquet``. Slow
-        path: file-by-file, which is robust to schema evolution at the
-        cost of cross-file optimization.
+        Polars invokes this lazily — the catalog is not touched until the
+        engine actually needs the schema (e.g. at ``.collect()`` or when
+        the user reads ``.schema``).
         """
-        r = self.resolve()
-        if r.is_empty:
-            # Empty table: zero-row LazyFrame with the catalog schema. Returning
-            # pl.scan_parquet([]) would raise; this preserves the public contract
-            # (LazyFrame with the right schema, .collect() yields zero rows).
-            return pl.LazyFrame(schema=r.polars_schema)
-        if r.fast_path_eligible:
-            clean_paths = [plan.full_path for plan in r.per_file_plans]
-            return pl.scan_parquet(
-                clean_paths, storage_options=self.storage_options
-            ).select(list(r.polars_schema.keys()))
-        frames = [
-            plan.build(storage_options=self.storage_options)
-            for plan in r.per_file_plans
-        ]
-        if len(frames) == 1:
-            return frames[0]
-        return pl.concat(frames, how="vertical")
+        return pl.Schema(self.resolve().polars_schema)
+
+    def build_lazyframe(self) -> pl.LazyFrame:
+        """Wire the IO plugin and return a LazyFrame.
+
+        The returned frame is a single ``IO_SOURCE`` node. Polars hands
+        the deserialized predicate, the projected columns, and any
+        ``n_rows`` cap back to the generator at scan time, so the engine
+        can drive pushdown end-to-end through one operator instead of
+        through an N-way concat of per-file scans.
+        """
+        return register_io_source(
+            io_source=_make_generator(self),
+            schema=self._polars_schema,
+            is_pure=True,
+        )
+
+
+def _make_generator(
+    ctx: _PlanContext,
+) -> Callable[
+    [list[str] | None, pl.Expr | None, int | None, int | None],
+    Iterator[pl.DataFrame],
+]:
+    """Build the generator Polars will drive.
+
+    Each invocation receives the projected columns, the deserialized
+    predicate, an ``n_rows`` cap, and a ``batch_size`` hint. We forward
+    predicate and projection to the per-file LazyFrame so Polars can
+    push them into ``scan_parquet``. ``batch_size`` is a hint we don't
+    yet honor — each file yields one DataFrame.
+    """
+
+    def _gen(
+        with_columns: list[str] | None,
+        predicate: pl.Expr | None,
+        n_rows: int | None,
+        _batch_size: int | None,
+    ) -> Iterator[pl.DataFrame]:
+        r = ctx.resolve()
+        remaining = n_rows
+        for plan in r.per_file_plans:
+            if remaining is not None and remaining <= 0:
+                return
+            lf = plan.build(storage_options=ctx.storage_options)
+            if predicate is not None:
+                # Polars pushes the filter into scan_parquet → row-group
+                # skipping via the file's own min/max stats.
+                lf = lf.filter(predicate)
+            if with_columns is not None:
+                # Projection pushdown likewise reaches scan_parquet.
+                lf = lf.select(with_columns)
+            if remaining is not None:
+                lf = lf.head(remaining)
+            df = lf.collect()
+            if df.height == 0:
+                continue
+            if remaining is not None:
+                remaining -= df.height
+            yield df
+
+    return _gen
