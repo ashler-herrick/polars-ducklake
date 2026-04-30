@@ -175,6 +175,20 @@ class TestRefusalCases:
         with pytest.raises(NotImplementedError, match="inlined"):
             pdl.scan_ducklake(builder.url, table="sales")
 
+    def test_flushed_inline_registry_does_not_refuse(
+        self, single_file_lake: dict[str, Any]
+    ) -> None:
+        # DuckDB's ducklake_flush_inlined_data empties the tracker but
+        # leaves the row in ducklake_inlined_data_tables. The reader must
+        # probe the tracker contents before refusing, otherwise users get
+        # a permanent NotImplementedError they can't work around.
+        builder = single_file_lake["builder"]
+        builder.add_inlined_data_table(
+            table_id=single_file_lake["table_id"], schema_version=1, populated=False
+        )
+        df = pdl.scan_ducklake(builder.url, table="sales").sort("id").collect()
+        assert df.height == single_file_lake["row_count"]
+
     # Nested types (LIST/STRUCT/MAP) are now supported — see
     # tests/test_backends_matrix.py for full coverage across every backend.
 

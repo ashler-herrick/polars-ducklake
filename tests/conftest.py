@@ -577,9 +577,18 @@ class DuckLakeBuilder:
             )
         return delete_file_id
 
-    def add_inlined_data_table(self, *, table_id: int, schema_version: int) -> None:
-        """Create the optional ``ducklake_inlined_data_tables`` table and
-        register a row pointing at the given table."""
+    def add_inlined_data_table(
+        self, *, table_id: int, schema_version: int, populated: bool = True
+    ) -> str:
+        """Register a tracker in ``ducklake_inlined_data_tables`` and create
+        the per-(table_id, schema_version) tracker table itself.
+
+        When ``populated`` is True, the tracker is given a placeholder row
+        — modelling the pre-flush state. When False, the tracker is created
+        but left empty, modelling the state DuckDB leaves behind after
+        ``ducklake_flush_inlined_data``: registry row intact, tracker empty.
+        """
+        tracker_name = f"ducklake_inlined_data_{table_id}_{schema_version}"
         with self._conn() as conn:
             conn.execute(
                 text(
@@ -598,12 +607,19 @@ class DuckLakeBuilder:
                     "(table_id, table_name, schema_version) "
                     "VALUES (:tid, :name, :sv)"
                 ),
-                {
-                    "tid": table_id,
-                    "name": f"ducklake_inlined_data_{table_id}_{schema_version}",
-                    "sv": schema_version,
-                },
+                {"tid": table_id, "name": tracker_name, "sv": schema_version},
             )
+            conn.execute(
+                text(
+                    f"CREATE TABLE IF NOT EXISTS {self._quote(tracker_name)} "
+                    "(row_id BIGINT)"
+                )
+            )
+            if populated:
+                conn.execute(
+                    text(f"INSERT INTO {self._quote(tracker_name)} (row_id) VALUES (1)")
+                )
+        return tracker_name
 
 
 @pytest.fixture()

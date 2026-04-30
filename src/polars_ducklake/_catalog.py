@@ -569,14 +569,39 @@ class CatalogReader(AbstractContextManager["CatalogReader"]):
     # -- inlined data + global metadata --------------------------------------
 
     def has_inlined_data(self, *, table_id: int) -> bool:
-        """Detect rows stored directly in the catalog (small writes)."""
+        """Detect rows stored directly in the catalog (small writes).
+
+        ``ducklake_inlined_data_tables`` is a *registry* of tracker tables
+        — one row per ``(table_id, schema_version)`` pair — not the inlined
+        rows themselves. DuckDB's ``ducklake_flush_inlined_data`` empties
+        the trackers but leaves the registry rows in place, so the registry
+        alone is not a reliable signal. Probe each tracker for at least one
+        row before refusing the read.
+        """
         if not self._table_exists("ducklake_inlined_data_tables"):
             return False
-        row = self._active_conn.execute(
-            text("SELECT 1 FROM ducklake_inlined_data_tables WHERE table_id = :table_id LIMIT 1"),
+        rows = self._active_conn.execute(
+            text(
+                "SELECT table_name FROM ducklake_inlined_data_tables "
+                "WHERE table_id = :table_id"
+            ),
             {"table_id": table_id},
-        ).first()
-        return row is not None
+        ).all()
+        if not rows:
+            return False
+        preparer = self._active_conn.engine.dialect.identifier_preparer
+        for (tracker_name,) in rows:
+            tracker_name = str(tracker_name)
+            # Defensive: the registry can outlive the tracker table itself
+            # in some lifecycle paths; treat a missing tracker as empty.
+            if not self._table_exists(tracker_name):
+                continue
+            probe = self._active_conn.execute(
+                text(f"SELECT 1 FROM {preparer.quote(tracker_name)} LIMIT 1")
+            ).first()
+            if probe is not None:
+                return True
+        return False
 
     def fetch_data_path(self) -> str | None:
         """Read the lake-wide ``data_path`` value from ``ducklake_metadata``.
