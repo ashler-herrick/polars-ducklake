@@ -18,7 +18,7 @@ canonical catalog SQL pattern.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -158,95 +158,22 @@ def scan_ducklake(
 
     schema, table = _resolve_table_identifier(schema=schema, table=table)
 
+    # Pin the snapshot eagerly so the LazyFrame's identity is stable across
+    # later catalog commits and so two scans built from the same call are
+    # interchangeable (relevant once we move to register_io_source's
+    # is_pure=True). Everything else is lazy on _PlanContext.
     with CatalogReader.from_metadata_catalog(metadata_catalog) as reader:
         target_snapshot = reader.resolve_snapshot_id(snapshot_id=snapshot_id, as_of=as_of)
-        schema_info = reader.resolve_schema(schema_name=schema, snapshot_id=target_snapshot)
-        table_info = reader.resolve_table(
-            schema_id=schema_info.schema_id,
-            table_name=table,
-            snapshot_id=target_snapshot,
-        )
-        table_id = table_info.table_id
 
-        if reader.has_inlined_data(table_id=table_id):
-            raise NotImplementedError(
-                f"Table {table!r} has inlined data stored directly in the catalog "
-                "(see ducklake_inlined_data_tables). polars-ducklake's scan_ducklake "
-                "is designed for the large-dataset path; inlined-data support is on "
-                "the future-work list. To unblock today, set "
-                "DATA_INLINING_ROW_LIMIT=0 on the catalog or run the writer's "
-                "inline-flush command to materialize inlined rows into Parquet."
-            )
-
-        target_columns = _build_target_columns(
-            reader.fetch_columns_with_nested(table_id=table_id, snapshot_id=target_snapshot)
-        )
-        polars_schema = {tc.name: tc.dtype for tc in target_columns}
-
-        data_files = reader.fetch_data_files(table_id=table_id, snapshot_id=target_snapshot)
-        delete_files = reader.fetch_delete_files(table_id=table_id, snapshot_id=target_snapshot)
-        effective_data_path = data_path if data_path is not None else reader.fetch_data_path()
-
-        if not data_files:
-            # Empty table: build a zero-row LazyFrame with the catalog schema.
-            # Returning an empty pl.scan_parquet([]) would raise; this preserves
-            # the public contract (LazyFrame with the right schema, .collect()
-            # yields zero rows) without that.
-            return pl.LazyFrame(schema=polars_schema)
-
-        schema_segment = PathSegment(
-            path=schema_info.path, is_relative=schema_info.path_is_relative
-        )
-        table_segment = PathSegment(path=table_info.path, is_relative=table_info.path_is_relative)
-
-        def _resolve(path: str, path_is_relative: bool) -> str:
-            return resolve_path(
-                path=path,
-                path_is_relative=path_is_relative,
-                data_path=effective_data_path,
-                schema_segment=schema_segment,
-                table_segment=table_segment,
-            )
-
-        # Group delete files by the data file they apply to. The catalog
-        # link via data_file_id is authoritative: even if a delete-file
-        # Parquet were to carry rows for multiple data files (its on-disk
-        # `file_path` column would distinguish them), the catalog tells us
-        # which data file each catalog row applies to.
-        deletes_by_file: dict[int, list[str]] = defaultdict(list)
-        for df in delete_files:
-            deletes_by_file[df.data_file_id].append(_resolve(df.path, df.path_is_relative))
-
-        # Decide each file's projection vs target. When *every* file's schema
-        # at its begin_snapshot matches target (no rename, no add/drop), and
-        # no file has deletes, we take the fast path: a single scan_parquet
-        # over all paths so Polars can optimize multi-file reads. Otherwise
-        # we go file-by-file, which is robust to schema evolution at the
-        # cost of losing cross-file optimization.
-        per_file_plans = [
-            _plan_file(
-                reader,
-                table_id=table_id,
-                file=f,
-                target_snapshot=target_snapshot,
-                target_columns=target_columns,
-                full_path=_resolve(f.path, f.path_is_relative),
-                delete_paths=deletes_by_file.get(f.data_file_id, []),
-            )
-            for f in data_files
-        ]
-
-    fast_path = not delete_files and all(plan.is_pure_passthrough for plan in per_file_plans)
-    if fast_path:
-        clean_paths = [plan.full_path for plan in per_file_plans]
-        return pl.scan_parquet(clean_paths, storage_options=storage_options).select(
-            list(polars_schema.keys())
-        )
-
-    frames = [plan.build(storage_options=storage_options) for plan in per_file_plans]
-    if len(frames) == 1:
-        return frames[0]
-    return pl.concat(frames, how="vertical")
+    ctx = _PlanContext(
+        metadata_catalog=metadata_catalog,
+        schema_name=schema,
+        table_name=table,
+        snapshot_id=target_snapshot,
+        storage_options=storage_options,
+        data_path=data_path,
+    )
+    return ctx.build_lazyframe()
 
 
 @dataclass(frozen=True)
@@ -425,3 +352,175 @@ def _scan_with_deletes(
     return data_lf.join(delete_lf, left_on=_ROW_INDEX_COL, right_on="pos", how="anti").drop(
         _ROW_INDEX_COL
     )
+
+
+@dataclass(frozen=True)
+class _Resolved:
+    """Cached output of one catalog resolution pass.
+
+    Holds everything the scan needs after the catalog connection has been
+    closed: the user-visible target columns, the per-file plans (paths
+    fully resolved, delete files attached, schema-evolution projections
+    baked in), and the empty/non-empty signal.
+    """
+
+    target_columns: list[_TargetColumn]
+    polars_schema: dict[str, pl.DataType]
+    per_file_plans: list[_FilePlan]
+    has_delete_files: bool
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.per_file_plans
+
+    @property
+    def fast_path_eligible(self) -> bool:
+        """True when every file's schema matches target and no deletes apply.
+
+        Lets us collapse to a single multi-file ``pl.scan_parquet`` so the
+        Polars engine can optimize across files.
+        """
+        return not self.has_delete_files and all(
+            plan.is_pure_passthrough for plan in self.per_file_plans
+        )
+
+
+@dataclass
+class _PlanContext:
+    """Lazy bridge between :func:`scan_ducklake`'s arguments and the data
+    needed to actually read.
+
+    ``snapshot_id`` is required to be already resolved (via
+    :meth:`CatalogReader.resolve_snapshot_id`) — pinning the snapshot at
+    call time is what makes the resulting LazyFrame reproducible against
+    later catalog commits. All other catalog work (schema/table/columns/
+    files/deletes) is deferred to :meth:`resolve` and memoized so the
+    schema callable and the read generator can both reach for it without
+    paying for it twice.
+    """
+
+    metadata_catalog: str | Engine
+    schema_name: str
+    table_name: str
+    snapshot_id: int
+    storage_options: dict[str, Any] | None
+    data_path: str | None
+    _resolved: _Resolved | None = field(default=None, init=False, repr=False)
+
+    def resolve(self) -> _Resolved:
+        if self._resolved is not None:
+            return self._resolved
+
+        with CatalogReader.from_metadata_catalog(self.metadata_catalog) as reader:
+            schema_info = reader.resolve_schema(
+                schema_name=self.schema_name, snapshot_id=self.snapshot_id
+            )
+            table_info = reader.resolve_table(
+                schema_id=schema_info.schema_id,
+                table_name=self.table_name,
+                snapshot_id=self.snapshot_id,
+            )
+            table_id = table_info.table_id
+
+            if reader.has_inlined_data(table_id=table_id):
+                raise NotImplementedError(
+                    f"Table {self.table_name!r} has inlined data stored directly "
+                    "in the catalog (see ducklake_inlined_data_tables). "
+                    "polars-ducklake's scan_ducklake is designed for the "
+                    "large-dataset path; inlined-data support is on the "
+                    "future-work list. To unblock today, set "
+                    "DATA_INLINING_ROW_LIMIT=0 on the catalog or run the "
+                    "writer's inline-flush command to materialize inlined "
+                    "rows into Parquet."
+                )
+
+            target_columns = _build_target_columns(
+                reader.fetch_columns_with_nested(
+                    table_id=table_id, snapshot_id=self.snapshot_id
+                )
+            )
+            polars_schema = {tc.name: tc.dtype for tc in target_columns}
+
+            data_files = reader.fetch_data_files(
+                table_id=table_id, snapshot_id=self.snapshot_id
+            )
+            delete_files = reader.fetch_delete_files(
+                table_id=table_id, snapshot_id=self.snapshot_id
+            )
+            effective_data_path = (
+                self.data_path if self.data_path is not None else reader.fetch_data_path()
+            )
+
+            schema_segment = PathSegment(
+                path=schema_info.path, is_relative=schema_info.path_is_relative
+            )
+            table_segment = PathSegment(
+                path=table_info.path, is_relative=table_info.path_is_relative
+            )
+
+            def _resolve_path(path: str, path_is_relative: bool) -> str:
+                return resolve_path(
+                    path=path,
+                    path_is_relative=path_is_relative,
+                    data_path=effective_data_path,
+                    schema_segment=schema_segment,
+                    table_segment=table_segment,
+                )
+
+            # Group delete files by the data file they apply to. The catalog
+            # link via data_file_id is authoritative: even if a delete-file
+            # Parquet were to carry rows for multiple data files, the catalog
+            # tells us which data file each catalog row applies to.
+            deletes_by_file: dict[int, list[str]] = defaultdict(list)
+            for df in delete_files:
+                deletes_by_file[df.data_file_id].append(
+                    _resolve_path(df.path, df.path_is_relative)
+                )
+
+            per_file_plans = [
+                _plan_file(
+                    reader,
+                    table_id=table_id,
+                    file=f,
+                    target_snapshot=self.snapshot_id,
+                    target_columns=target_columns,
+                    full_path=_resolve_path(f.path, f.path_is_relative),
+                    delete_paths=deletes_by_file.get(f.data_file_id, []),
+                )
+                for f in data_files
+            ]
+
+        self._resolved = _Resolved(
+            target_columns=target_columns,
+            polars_schema=polars_schema,
+            per_file_plans=per_file_plans,
+            has_delete_files=bool(delete_files),
+        )
+        return self._resolved
+
+    def build_lazyframe(self) -> pl.LazyFrame:
+        """Build the LazyFrame using the current ``pl.concat`` plan shape.
+
+        Fast path: when every file's schema matches target and no deletes
+        apply, collapse to a single multi-file ``pl.scan_parquet``. Slow
+        path: file-by-file, which is robust to schema evolution at the
+        cost of cross-file optimization.
+        """
+        r = self.resolve()
+        if r.is_empty:
+            # Empty table: zero-row LazyFrame with the catalog schema. Returning
+            # pl.scan_parquet([]) would raise; this preserves the public contract
+            # (LazyFrame with the right schema, .collect() yields zero rows).
+            return pl.LazyFrame(schema=r.polars_schema)
+        if r.fast_path_eligible:
+            clean_paths = [plan.full_path for plan in r.per_file_plans]
+            return pl.scan_parquet(
+                clean_paths, storage_options=self.storage_options
+            ).select(list(r.polars_schema.keys()))
+        frames = [
+            plan.build(storage_options=self.storage_options)
+            for plan in r.per_file_plans
+        ]
+        if len(frames) == 1:
+            return frames[0]
+        return pl.concat(frames, how="vertical")
