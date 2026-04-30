@@ -1,0 +1,104 @@
+# Project-local infrastructure for polars-ducklake integration tests.
+#
+# Every service runs on a non-default port and uses a project-prefixed
+# container/volume name so this stack is fully isolated from anything
+# else the developer has running locally. Credentials are intentionally
+# obvious test-only values; do not reuse them anywhere real.
+#
+# Usage:
+#   docker compose up -d              # start everything
+#   uv run pytest -m integration      # run the integration suite
+#   docker compose down -v            # stop and wipe data
+
+name: polars-ducklake
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: polars-ducklake-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin-test-pwd
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "mc ready local || exit 1"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # One-shot init: wait for MinIO healthy, create the test bucket, exit.
+  # Idempotent across restarts (mc mb without --strict won't fail if the
+  # bucket already exists).
+  minio-init:
+    image: minio/mc:latest
+    container_name: polars-ducklake-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin-test-pwd
+        mc mb -p local/polars-ducklake-test || true
+        echo "minio bucket ready: polars-ducklake-test"
+    restart: "no"
+
+  postgres:
+    image: postgres:17
+    container_name: polars-ducklake-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-test-pwd
+      POSTGRES_DB: polars_ducklake_test
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pg_isready -U postgres -d polars_ducklake_test"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  mysql:
+    image: mysql:8.0
+    container_name: polars-ducklake-mysql
+    # Pinned to 8.0 (not :8 which now resolves to 8.4) and switched to
+    # the older mysql_native_password auth plugin: the DuckDB ducklake
+    # extension has shown "got packets out of order" / "server has gone
+    # away" failures against caching_sha2_password.
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --max_allowed_packet=128M
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql-test-pwd
+      MYSQL_DATABASE: polars_ducklake_test
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD --silent"
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+
+volumes:
+  minio-data:
+  postgres-data:
+  mysql-data:

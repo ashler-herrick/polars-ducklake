@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Test/coverage artifacts
+.coverage
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov/
+
+# Per-developer overrides (point at non-docker-compose infra, etc.)
+tests/.env.local
