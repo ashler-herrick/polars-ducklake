@@ -119,6 +119,24 @@ class DeleteFileInfo:
     path_is_relative: bool
 
 
+@dataclass(frozen=True)
+class FileColumnStat:
+    """Per-file, per-column statistics from ``ducklake_file_column_stats``.
+
+    ``min_value`` and ``max_value`` are the *raw* VARCHAR forms written by
+    the writer. Coercing them to typed Python values is the predicate
+    pruner's job (it knows the column's logical type).
+    """
+
+    data_file_id: int
+    column_id: int
+    min_value: str | None
+    max_value: str | None
+    null_count: int | None
+    value_count: int | None
+    contains_nan: bool | None
+
+
 # ---------------------------------------------------------------------------
 # Connection-string parsing
 # ---------------------------------------------------------------------------
@@ -562,6 +580,49 @@ class CatalogReader(AbstractContextManager["CatalogReader"]):
                 data_file_id=int(r[0]),
                 path=str(r[1]),
                 path_is_relative=bool(r[2]),
+            )
+            for r in rows
+        ]
+
+    def fetch_file_stats(
+        self, *, data_file_ids: list[int], column_ids: list[int]
+    ) -> list[FileColumnStat]:
+        """Fetch min/max/null counts for the given (file, column) pairs.
+
+        Visibility is established by the caller (``data_file_ids`` should
+        already be filtered to files visible at the read snapshot), so
+        this method does not apply MVCC filters of its own — it's a pure
+        lookup against ``ducklake_file_column_stats``.
+
+        Returns an empty list if either input is empty (so callers don't
+        have to special-case "no predicate columns" before calling).
+        """
+        if not data_file_ids or not column_ids:
+            return []
+        stmt = text(
+            """
+            SELECT data_file_id, column_id, min_value, max_value,
+                   null_count, value_count, contains_nan
+            FROM ducklake_file_column_stats
+            WHERE data_file_id IN :file_ids
+              AND column_id IN :column_ids
+            """
+        ).bindparams(
+            sqlalchemy.bindparam("file_ids", expanding=True),
+            sqlalchemy.bindparam("column_ids", expanding=True),
+        )
+        rows = self._active_conn.execute(
+            stmt, {"file_ids": data_file_ids, "column_ids": column_ids}
+        ).all()
+        return [
+            FileColumnStat(
+                data_file_id=int(r[0]),
+                column_id=int(r[1]),
+                min_value=str(r[2]) if r[2] is not None else None,
+                max_value=str(r[3]) if r[3] is not None else None,
+                null_count=int(r[4]) if r[4] is not None else None,
+                value_count=int(r[5]) if r[5] is not None else None,
+                contains_nan=bool(r[6]) if r[6] is not None else None,
             )
             for r in rows
         ]

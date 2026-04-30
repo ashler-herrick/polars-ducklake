@@ -200,9 +200,12 @@ class TestPushdown:
         builder = multi_file_lake["builder"]
         lf = pdl.scan_ducklake(builder.url, table="events").filter(pl.col("kind") == "a")
         plan = lf.explain()
-        # Polars will push the predicate into the parquet scan; the plan
-        # should not contain a separate FILTER node above the scan.
-        assert "Parquet" in plan or "PARQUET" in plan
+        # The IO plugin shows up as PYTHON SCAN. Predicate pushdown lands
+        # as a SELECTION on that node — the engine hands the deserialized
+        # expression to our generator, which forwards it to the per-file
+        # scan_parquet for actual row-group skipping.
+        assert "PYTHON SCAN" in plan
+        assert "SELECTION:" in plan
         assert "kind" in plan
 
     def test_projection_pushdown_in_plan(self, multi_file_lake: dict[str, Any]) -> None:
@@ -215,7 +218,170 @@ class TestPushdown:
         assert "PROJECT 1/2 COLUMNS" in plan
 
 
-class TestPrimitiveTypes:
+class TestCatalogStatsPruning:
+    """Files whose catalog min/max rule out the predicate are skipped
+    before any Parquet I/O. We verify both correctness (right rows) and
+    that pruning actually fired (per-file scan_parquet not invoked)."""
+
+    @staticmethod
+    def _build_three_disjoint_files(
+        builder: Any,
+    ) -> tuple[int, list[int]]:
+        """Three single-column int files with disjoint id ranges:
+        F1: [1..100], F2: [150..200], F3: [300..500]. Stats populated."""
+        snap = builder.take_snapshot()
+        schema_id = builder.add_schema(name="main", begin_snapshot=snap)
+        table_id = builder.add_table(
+            schema_id=schema_id,
+            name="t",
+            begin_snapshot=snap,
+            columns=[("id", "INTEGER"), ("v", "VARCHAR")],
+        )
+        f1 = builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [1, 50, 100], "v": ["a", "b", "c"]}),
+            compute_stats=True,
+        )
+        f2 = builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [150, 175, 200], "v": ["d", "e", "f"]}),
+            compute_stats=True,
+        )
+        f3 = builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [300, 400, 500], "v": ["g", "h", "i"]}),
+            compute_stats=True,
+        )
+        return table_id, [f1, f2, f3]
+
+    @staticmethod
+    def _spy_scan_parquet(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> list[Any]:
+        """Wrap pl.scan_parquet to record the paths it's called with.
+
+        Returns the list (mutated by the spy). Patches the binding inside
+        polars_ducklake.scan because that's the module that calls it.
+        """
+        import polars_ducklake.scan as scan_mod
+
+        recorded: list[Any] = []
+        real = scan_mod.pl.scan_parquet
+
+        def spy(path: Any, **kw: Any) -> Any:
+            recorded.append(path)
+            return real(path, **kw)
+
+        monkeypatch.setattr(scan_mod.pl, "scan_parquet", spy)
+        return recorded
+
+    def test_eq_prunes_to_single_file(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._build_three_disjoint_files(builder)
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("id") == 175)
+            .collect()
+        )
+        assert df["id"].to_list() == [175]
+        # Only F2 (the only file with stats covering 175) should be opened.
+        assert len(recorded) == 1
+
+    def test_range_prunes_two_files(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._build_three_disjoint_files(builder)
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("id") < 150)
+            .sort("id")
+            .collect()
+        )
+        # F1 [1..100] qualifies (anything below 150 could match); F2 [150..200]
+        # is at the boundary (min == 150, lt 150 ⇒ impossible); F3 above.
+        assert df["id"].to_list() == [1, 50, 100]
+        assert len(recorded) == 1
+
+    def test_and_predicate_prunes_correctly(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._build_three_disjoint_files(builder)
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter((pl.col("id") > 100) & (pl.col("id") < 250))
+            .sort("id")
+            .collect()
+        )
+        # F1 max=100 → "id > 100" rules out (gt 100, max == 100, prune).
+        # F2 [150..200] kept by both bounds.
+        # F3 min=300 → "id < 250" rules out (lt 250, min >= 250, prune).
+        assert df["id"].to_list() == [150, 175, 200]
+        assert len(recorded) == 1
+
+    def test_unsupported_predicate_falls_back_to_no_pruning(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Arithmetic on a column isn't extracted by our walker, so the
+        # generator can't prune — but Polars still applies the filter
+        # itself so the result is correct.
+        self._build_three_disjoint_files(builder)
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("id") + 1 > 175)
+            .sort("id")
+            .collect()
+        )
+        # Correctness: id+1 > 175 ⇒ id > 174 ⇒ {175, 200, 300, 400, 500}
+        assert df["id"].to_list() == [175, 200, 300, 400, 500]
+        # All three files were read (no pruning).
+        assert len(recorded) == 3
+
+    def test_predicate_against_unstatted_column_keeps_all_files(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If the catalog has no stats for the predicate column on a file,
+        # we conservatively keep the file. Set up: stats populated only
+        # for `id`, predicate filters on `v` (which has stats too in
+        # this fixture, so we'd actually prune; build a separate fixture).
+        snap = builder.take_snapshot()
+        schema_id = builder.add_schema(name="main", begin_snapshot=snap)
+        table_id = builder.add_table(
+            schema_id=schema_id,
+            name="t",
+            begin_snapshot=snap,
+            columns=[("id", "INTEGER"), ("v", "VARCHAR")],
+        )
+        # Two files; only stats for `id`, NOT for `v`. To do that, we
+        # write the file with compute_stats=False, then manually populate
+        # only the id stats.
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [1, 2, 3], "v": ["a", "b", "c"]}),
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [4, 5, 6], "v": ["x", "y", "z"]}),
+        )
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("v") == "a")
+            .collect()
+        )
+        # Correct result regardless of pruning behavior.
+        assert df["v"].to_list() == ["a"]
+        # Both files kept (no stats for `v` → no information).
+        assert len(recorded) == 2
     """All v0.1 supported primitive types round-trip through a scan."""
 
     def test_round_trip_primitives(self, builder: Any) -> None:

@@ -648,7 +648,7 @@ wheels = [
 
 [[package]]
 name = "polars-ducklake"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "polars" },
@@ -687,7 +687,7 @@ dev = [
 requires-dist = [
     { name = "duckdb-engine", marker = "extra == 'duckdb-catalog'", specifier = ">=0.13" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
-    { name = "polars", specifier = ">=1.0" },
+    { name = "polars", specifier = ">=1.20" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pyarrow", marker = "extra == 'dev'", specifier = ">=15" },
     { name = "pymysql", marker = "extra == 'mysql'", specifier = ">=1.1" },
