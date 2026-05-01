@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "polars-ducklake"
-version = "0.2.0"
+version = "0.2.1"
 description = "Native DuckLake reader for Polars (no DuckDB runtime dependency)"
 readme = "README.md"
 license = { file = "LICENSE" }
