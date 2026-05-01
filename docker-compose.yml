@@ -34,9 +34,14 @@ services:
       retries: 10
       start_period: 5s
 
-  # One-shot init: wait for MinIO healthy, create the test bucket, exit.
-  # Idempotent across restarts (mc mb without --strict won't fail if the
-  # bucket already exists).
+  # One-shot init: wait for MinIO healthy, create every test/bench bucket,
+  # exit. Idempotent across restarts (mc mb -p won't fail if the bucket
+  # already exists).
+  #
+  # The bench buckets are split per catalog backend so any bleed across
+  # ducklake's catalog-migration semantics (e.g. SQLite → Postgres
+  # quirks) cannot contaminate another backend's seeded data. See
+  # bench/targets.py and the discussion on issue #9.
   minio-init:
     image: minio/mc:latest
     container_name: polars-ducklake-minio-init
@@ -49,7 +54,10 @@ services:
       - |
         mc alias set local http://minio:9000 minioadmin minioadmin-test-pwd
         mc mb -p local/polars-ducklake-test || true
-        echo "minio bucket ready: polars-ducklake-test"
+        mc mb -p local/polars-ducklake-bench-sqlite || true
+        mc mb -p local/polars-ducklake-bench-postgres || true
+        mc mb -p local/polars-ducklake-bench-duckdb || true
+        echo "minio buckets ready: polars-ducklake-test, polars-ducklake-bench-{sqlite,postgres,duckdb}"
     restart: "no"
 
   postgres:

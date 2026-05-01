@@ -175,7 +175,10 @@ def translate_clause(
     # Conservative-keep guards: NaN poisons numeric ordering, missing
     # min/max means "no info". Either case keeps the file regardless of
     # the bound check.
-    nan_guard = "(contains_nan IS NOT NULL AND contains_nan = 1)"
+    # ``contains_nan`` is BOOLEAN per the DuckLake spec; Postgres rejects
+    # ``= 1`` on a boolean column. Bare-truthy works on every backend
+    # (SQLite stores 0/1 ints; PG/DuckDB store booleans natively).
+    nan_guard = "(contains_nan IS NOT NULL AND contains_nan)"
     null_guard = "(min_value IS NULL OR max_value IS NULL)"
     full = f"({nan_guard} OR {null_guard} OR {bound})"
     return _ClauseSql(sql=full, params={p_name: bind_value})

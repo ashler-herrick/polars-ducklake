@@ -56,15 +56,14 @@ class PostgresConfig:
         )
 
 
-def load_config() -> PostgresConfig | None:
-    """Return Postgres config, or None if any required key is missing."""
+def _load(database_var: str) -> PostgresConfig | None:
     values = env()
     required = (
         "POSTGRES_HOST",
         "POSTGRES_PORT",
         "POSTGRES_USER",
         "POSTGRES_PASSWORD",
-        "POSTGRES_TEST_DATABASE",
+        database_var,
     )
     if not all(values.get(k) for k in required):
         return None
@@ -73,8 +72,44 @@ def load_config() -> PostgresConfig | None:
         port=int(values["POSTGRES_PORT"]),
         user=values["POSTGRES_USER"],
         password=values["POSTGRES_PASSWORD"],
-        database=values["POSTGRES_TEST_DATABASE"],
+        database=values[database_var],
     )
+
+
+def load_config() -> PostgresConfig | None:
+    """Return integration-test Postgres config, or None if any key is missing."""
+    return _load("POSTGRES_TEST_DATABASE")
+
+
+def load_bench_config() -> PostgresConfig | None:
+    """Return bench Postgres config (separate DB so the integration suite
+    can drop its tables without wiping a seeded bench lake)."""
+    return _load("POSTGRES_BENCH_DATABASE")
+
+
+def ensure_database_exists(cfg: PostgresConfig) -> None:
+    """Create ``cfg.database`` if it doesn't exist yet.
+
+    Connects to the maintenance ``postgres`` DB on the same instance
+    and issues ``CREATE DATABASE`` outside a transaction (PG won't
+    allow CREATE DATABASE in one). Idempotent.
+    """
+    admin = sqlalchemy.create_engine(
+        f"postgresql+psycopg://{cfg.user}:{cfg.password}@{cfg.host}:{cfg.port}/postgres",
+        isolation_level="AUTOCOMMIT",
+    )
+    try:
+        with admin.connect() as conn:
+            exists = conn.execute(
+                sqlalchemy.text("SELECT 1 FROM pg_database WHERE datname = :n"),
+                {"n": cfg.database},
+            ).scalar()
+            if not exists:
+                # Database name comes from a checked-in env file we control;
+                # quoting just to be defensive.
+                conn.execute(sqlalchemy.text(f'CREATE DATABASE "{cfg.database}"'))
+    finally:
+        admin.dispose()
 
 
 class PostgresTestClient:

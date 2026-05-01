@@ -18,3 +18,7 @@ htmlcov/
 
 # Per-developer overrides (point at non-docker-compose infra, etc.)
 tests/.env.local
+
+# Local bench fixture registry — points at machine-local catalog files
+# and per-host MinIO buckets. Build with `python -m bench.seed`.
+bench/state.json
