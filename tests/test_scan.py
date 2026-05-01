@@ -218,6 +218,117 @@ class TestPushdown:
         assert "PROJECT 1/2 COLUMNS" in plan
 
 
+class TestFastPathCollapse:
+    """Pure-passthrough multi-file scans collapse to a single
+    pl.scan_parquet([paths]) call instead of N per-file calls.
+
+    The collapse fires only when every file is delete-free,
+    pure-passthrough (physical schema matches target), and partial-
+    filter-free. Mixed eligibility falls through to the per-file loop.
+    """
+
+    @staticmethod
+    def _spy_scan_parquet(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        import polars_ducklake.scan as scan_mod
+
+        recorded: list[Any] = []
+        real = scan_mod.pl.scan_parquet
+
+        def spy(path: Any, **kw: Any) -> Any:
+            recorded.append(path)
+            return real(path, **kw)
+
+        monkeypatch.setattr(scan_mod.pl, "scan_parquet", spy)
+        return recorded
+
+    def test_pure_passthrough_collapses_to_single_call(
+        self, multi_file_lake: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(multi_file_lake["builder"].url, table="events")
+            .sort("id")
+            .collect()
+        )
+        # Correctness: same result as the per-file path produced.
+        assert df.height == multi_file_lake["row_count"]
+        assert df["id"].to_list() == list(range(1, multi_file_lake["row_count"] + 1))
+        # One scan_parquet call, with a list of every data-file path.
+        assert len(recorded) == 1
+        assert isinstance(recorded[0], list)
+        assert len(recorded[0]) >= 2  # multi_file_lake builds ≥2 files
+
+    def test_deletes_force_per_file_path(
+        self,
+        multi_file_lake: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Mixed eligibility: one file gets a delete, others stay clean.
+        # Fast path is all-or-nothing → falls through to per-file loop.
+        builder = multi_file_lake["builder"]
+        snap = builder.take_snapshot()
+        builder.add_delete_file(
+            table_id=multi_file_lake["table_id"],
+            begin_snapshot=snap,
+            data_file_id=1,
+            positions=[0],
+        )
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = pdl.scan_ducklake(builder.url, table="events").sort("id").collect()
+        assert df.height == multi_file_lake["row_count"] - 1
+        # Per-file form: each data file is a separate string-path call.
+        # (Delete files still pass a list to scan_parquet, so allow lists
+        # too — the discriminator is that we see ≥3 individual string
+        # paths, one per data file, instead of one collapsed list call.)
+        string_calls = [r for r in recorded if isinstance(r, str)]
+        assert len(string_calls) >= 3
+
+    def test_schema_evolution_forces_per_file_path(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Older file lacks the newly-added column → its plan null-fills
+        # `extra` → is_pure_passthrough=False → fast path skipped.
+        snap1 = builder.take_snapshot()
+        schema_id = builder.add_schema(name="main", begin_snapshot=snap1)
+        table_id = builder.add_table(
+            schema_id=schema_id,
+            name="t",
+            begin_snapshot=snap1,
+            columns=[("id", "INTEGER")],
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap1,
+            df=pl.DataFrame({"id": [1, 2]}),
+        )
+        snap2 = builder.take_snapshot()
+        builder.add_column(
+            table_id=table_id,
+            begin_snapshot=snap2,
+            column_name="extra",
+            column_type="DOUBLE",
+            column_order=1,
+        )
+        snap3 = builder.take_snapshot()
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap3,
+            df=pl.DataFrame({"id": [3, 4], "extra": [1.0, 2.0]}),
+        )
+        recorded = self._spy_scan_parquet(monkeypatch)
+        pdl.scan_ducklake(builder.url, table="t").collect()
+        assert len(recorded) == 2
+        assert all(isinstance(r, str) for r in recorded)
+
+    def test_n_rows_pushdown_through_fast_path(
+        self, multi_file_lake: dict[str, Any]
+    ) -> None:
+        # head() composes with the multi-file scan's own n_rows pushdown.
+        builder = multi_file_lake["builder"]
+        df = pdl.scan_ducklake(builder.url, table="events").head(3).collect()
+        assert df.height == 3
+
+
 class TestCatalogStatsPruning:
     """Files whose catalog min/max rule out the predicate are skipped
     before any Parquet I/O. We verify both correctness (right rows) and
@@ -341,8 +452,12 @@ class TestCatalogStatsPruning:
         )
         # Correctness: id+1 > 175 ⇒ id > 174 ⇒ {175, 200, 300, 400, 500}
         assert df["id"].to_list() == [175, 200, 300, 400, 500]
-        # All three files were read (no pruning).
-        assert len(recorded) == 3
+        # All three files were read (no pruning) — the pure-passthrough
+        # fast path collapses them into one multi-file scan_parquet call
+        # carrying every path.
+        assert len(recorded) == 1
+        assert isinstance(recorded[0], list)
+        assert len(recorded[0]) == 3
 
     def test_predicate_against_unstatted_column_keeps_all_files(
         self, builder: Any, monkeypatch: pytest.MonkeyPatch
@@ -380,8 +495,11 @@ class TestCatalogStatsPruning:
         )
         # Correct result regardless of pruning behavior.
         assert df["v"].to_list() == ["a"]
-        # Both files kept (no stats for `v` → no information).
-        assert len(recorded) == 2
+        # Both files kept (no stats for `v` → no information). Fast path
+        # collapses them to one multi-file scan call.
+        assert len(recorded) == 1
+        assert isinstance(recorded[0], list)
+        assert len(recorded[0]) == 2
     """All v0.1 supported primitive types round-trip through a scan."""
 
     def test_round_trip_primitives(self, builder: Any) -> None:

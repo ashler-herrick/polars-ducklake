@@ -289,9 +289,14 @@ def _plan_file(
     needs_partial_filter = file.partial_max is not None and target_snapshot < file.partial_max
 
     exprs: list[pl.Expr] = []
+    # Partial files always carry an extra `_ducklake_internal_snapshot_id`
+    # physical column that the per-file projection drops via select(...).
+    # Even when target_snapshot >= partial_max (no row filter needed),
+    # the file isn't pure-passthrough — bypassing the projection would
+    # leak the internal column into the output schema.
     is_pure = (
         not delete_paths
-        and not needs_partial_filter
+        and file.partial_max is None
         and len(file_columns_by_id) == len(target_columns)
     )
     for tc in target_columns:
@@ -493,6 +498,33 @@ def _make_generator(
         # when the consumer exhausts or closes the generator.
         with CatalogReader.from_engine(ctx.engine) as reader:
             plans = _build_plans(reader, ctx, predicate)
+
+            # Fast path: when every file is delete-free, pure-passthrough,
+            # and partial-filter-free, collapse the per-file loop into one
+            # multi-file scan_parquet. Polars then sees a single MultiScan
+            # operator (one shared projection plan, batched footer fetches)
+            # instead of N independent ParquetSource nodes.
+            fast_path_eligible = bool(plans) and all(
+                not p.delete_paths
+                and p.is_pure_passthrough
+                and p.partial_filter_at is None
+                for p in plans
+            )
+            if fast_path_eligible:
+                lf = pl.scan_parquet(
+                    [p.full_path for p in plans],
+                    storage_options=ctx.storage_options,
+                )
+                if predicate is not None:
+                    lf = lf.filter(predicate)
+                if with_columns is not None:
+                    lf = lf.select(with_columns)
+                if n_rows is not None:
+                    lf = lf.head(n_rows)
+                df = lf.collect(engine="streaming")
+                if df.height > 0:
+                    yield df
+                return
 
             remaining = n_rows
             for plan in plans:
