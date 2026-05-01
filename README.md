@@ -4,10 +4,15 @@ A native [DuckLake](https://ducklake.select/) reader for [Polars](https://pola.r
 — with no DuckDB runtime dependency.
 
 DuckLake stores all metadata in a SQL catalog database and all data in Parquet
-files. `polars-ducklake` exploits that design directly: it issues a few `SELECT`
-queries against the catalog to resolve a list of Parquet paths, then hands them
-to `pl.scan_parquet` so Polars can do all of its native optimization
-(predicate pushdown, projection pushdown, streaming).
+files. `polars-ducklake` exploits that design directly: `scan_ducklake` is
+registered as a Polars IO plugin (`polars.io.plugins.register_io_source`) and
+returns a single `IO_SOURCE` LazyFrame node. Polars hands the deserialized
+predicate, projected columns, and any `n_rows` cap back to the reader, which
+prunes whole files using the catalog's min/max stats and then forwards what
+remains into per-file `pl.scan_parquet` calls — so projection pushdown,
+predicate pushdown, and streaming all still reach the Parquet engine.
+
+Requires `polars >= 1.20`.
 
 ## Install
 
@@ -35,7 +40,6 @@ then this package reads it back and checks the results.
 | **PostgreSQL** | Verified | Requires `[postgres]`; tested against PG 17. |
 | **DuckDB-as-catalog** | Verified | Requires `[duckdb-catalog]` (`duckdb-engine`). |
 | **MySQL** | Reader verified | `[mysql]` installs `pymysql`. Every read behavior (round-trip, time travel, deletes, schema evolution, partial files) is verified against MySQL 8.0 in the cross-backend test matrix. End-to-end writer round-trip via the DuckDB ducklake+mysql extension is currently unstable upstream — until that's resolved, populate MySQL-backed catalogs with another writer. |
-| Anything else SQLAlchemy supports | Best-effort | Pass a pre-built `Engine` or a SQLAlchemy URL directly. |
 
 ## Quickstart
 
@@ -127,11 +131,20 @@ lf = pdl.scan_ducklake(
   NOT NULL`) get a per-row snapshot filter applied for time-travel
   reads, so pinning to an older snapshot returns only rows whose origin
   was at-or-before that snapshot.
+- **Catalog-stats file pruning** — supported predicate shapes (a flat
+  AND of `eq`/`ne`/`lt`/`le`/`gt`/`ge` against a literal, plus
+  `is_null`/`is_not_null`) are matched against
+  `ducklake_file_column_stats` so files whose per-column min/max
+  provably can't satisfy the filter are dropped before any Parquet I/O.
+  Pruning is conservative: unrecognized predicate shapes (`OR`,
+  `is_in`, arithmetic on a column, NaN-tainted floats, missing stats)
+  keep the file and Polars handles the filter post-yield.
 
-The returned `LazyFrame` is just a `pl.scan_parquet` (or a `pl.concat`
-of several when per-file work is needed). All predicate / projection
-pushdown is handled by the Polars query engine — `lf.filter(...)` and
-`lf.select(...)` work exactly as they do on any other Polars source.
+The returned `LazyFrame` is a single `IO_SOURCE` node — `.explain()`
+shows `PYTHON SCAN` rather than `Parquet SCAN`. `lf.filter(...)` and
+`lf.select(...)` work exactly as they do on any other Polars source;
+the predicate and projection are deserialized and pushed back into the
+reader, which forwards them to per-file `pl.scan_parquet` calls.
 
 ## Current limitations
 
@@ -156,18 +169,34 @@ read those columns via PyArrow until the upstream Polars fix lands.
 
 ## How it works
 
-`scan_ducklake` runs roughly the following steps:
+`scan_ducklake` is split into eager identity resolution and a deferred
+plan that Polars drives through the IO-plugin contract.
+
+**Eagerly, at call time:**
 
 1. Normalize the catalog argument to a SQLAlchemy `Engine`.
 2. Resolve the target snapshot (latest, by `snapshot_id`, or by `as_of`).
 3. Look up the `schema_id` / `table_id` from `ducklake_schema` /
-   `ducklake_table` using DuckLake's MVCC visibility filter.
-4. Verify the table has no nested columns or inlined data at the
-   target snapshot.
-5. Read the active column set at the target snapshot (renames,
-   adds, drops applied), the data files, the positional-delete files,
-   and the lake-wide `data_path`.
-6. Plan each data file individually:
+   `ducklake_table` using DuckLake's MVCC visibility filter, and
+   refuse inlined-data tables. These raise `LookupError` /
+   `NotImplementedError` directly from the call rather than being
+   wrapped in `ComputeError` at `.collect()` time.
+4. Register an IO source via
+   `polars.io.plugins.register_io_source(..., is_pure=True)` and
+   return its `LazyFrame`. Heavier catalog work is deferred to a
+   memoized `_PlanContext`.
+
+**Lazily, when Polars drives the read:**
+
+5. Read the active column set at the target snapshot (renames, adds,
+   drops applied), the data files, the positional-delete files, and
+   the lake-wide `data_path`.
+6. Take the pushed predicate from Polars and walk its serialized
+   form to extract a flat AND of supported leaves; match those
+   against `ducklake_file_column_stats` and drop files whose per-column
+   min/max can't satisfy them. Anything unrecognized falls through and
+   keeps the file (false negatives, never false positives).
+7. Plan each surviving data file individually:
    - **Schema evolution**: query `ducklake_column` at the file's
      `begin_snapshot` and translate physical names through stable
      `column_id`s (`pl.col(old_name).alias(new_name)`); null-fill
@@ -175,10 +204,8 @@ read those columns via PyArrow until the upstream Polars fix lands.
    - **Deletes**: per-file anti-join on the delete file's `pos`.
    - **Compacted files**: when the target is older than `partial_max`,
      filter rows by the writer-emitted `_ducklake_internal_snapshot_id`.
-7. **Fast path**: if every file's schema matches target exactly and
-   nobody needs deletes or partial filtering, do a single
-   `pl.scan_parquet(paths)` so Polars can optimize across files.
-8. Otherwise concatenate the per-file `LazyFrame`s.
+8. Yield each file's `pl.scan_parquet` LazyFrame to Polars with the
+   pushed `with_columns` / `predicate` / `n_rows` applied.
 
 All catalog queries use parameterized SQL (no f-string interpolation) and
 the spec's MVCC clause:

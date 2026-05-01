@@ -170,7 +170,7 @@ def scan_ducklake(
         If the requested snapshot, schema, or table is not visible in
         the metadata catalog.
     NotImplementedError
-        If the table has any nested-type columns or any inlined data.
+        If the table has any inlined data.
         These are refused loudly rather than silently producing wrong
         results.
     """
