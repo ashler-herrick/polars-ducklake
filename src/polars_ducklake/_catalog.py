@@ -30,6 +30,7 @@ canonical catalog SQL pattern this code follows.
 from __future__ import annotations
 
 import shlex
+import threading
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -270,6 +271,18 @@ def _require_duckdb_engine() -> None:
         ) from exc
 
 
+# Process-wide cache of engines built from string inputs. Keyed by the
+# post-translation SQLAlchemy URL so ``ducklake:sqlite:foo.db`` and
+# ``sqlite:///foo.db`` collapse to the same entry. Pre-built ``Engine``
+# arguments bypass the cache entirely — the caller owns disposal.
+#
+# Engines are kept for process lifetime; they hold a connection pool
+# (typically idle) but no checked-out resources between scans, so the
+# memory cost is small compared to the per-scan handshake we save.
+_ENGINE_CACHE: dict[str, Engine] = {}
+_ENGINE_CACHE_LOCK = threading.Lock()
+
+
 def _engine_from_metadata_catalog(metadata_catalog: str | Engine) -> Engine:
     """Normalise any catalog input into a SQLAlchemy ``Engine``.
 
@@ -279,6 +292,9 @@ def _engine_from_metadata_catalog(metadata_catalog: str | Engine) -> Engine:
     * an already-built :class:`sqlalchemy.engine.Engine`,
     * a SQLAlchemy URL string,
     * a DuckLake-native ``ducklake:...`` connection string.
+
+    String inputs are memoised by their post-translation URL so successive
+    scans against the same catalog reuse one SQLAlchemy pool.
     """
     if isinstance(metadata_catalog, Engine):
         return metadata_catalog
@@ -295,15 +311,28 @@ def _engine_from_metadata_catalog(metadata_catalog: str | Engine) -> Engine:
         else metadata_catalog
     )
 
+    with _ENGINE_CACHE_LOCK:
+        cached = _ENGINE_CACHE.get(url)
+    if cached is not None:
+        return cached
+
     if url.startswith("duckdb:"):
         _require_duckdb_engine()
 
     try:
-        return sqlalchemy.create_engine(url)
+        engine = sqlalchemy.create_engine(url)
     except Exception as exc:
         raise ValueError(
             f"Could not build SQLAlchemy engine from {metadata_catalog!r}: {exc}"
         ) from exc
+
+    # Two threads racing on the same URL each build their own engine; the
+    # loser's engine is disposed so its pool is released cleanly.
+    with _ENGINE_CACHE_LOCK:
+        existing = _ENGINE_CACHE.setdefault(url, engine)
+    if existing is not engine:
+        engine.dispose()
+    return existing
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +378,17 @@ class CatalogReader(AbstractContextManager["CatalogReader"]):
         See the module docstring for accepted forms.
         """
         return cls(_engine_from_metadata_catalog(metadata_catalog))
+
+    @classmethod
+    def from_engine(cls, engine: Engine) -> CatalogReader:
+        """Build a reader directly from an already-resolved engine.
+
+        Used inside the scan after :func:`_engine_from_metadata_catalog`
+        has resolved the user's argument once — successive readers in
+        the same scan skip the parse/cache lookup that
+        :meth:`from_metadata_catalog` performs.
+        """
+        return cls(engine)
 
     @property
     def engine(self) -> Engine:
