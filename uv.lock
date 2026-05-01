@@ -679,8 +679,11 @@ dev = [
     { name = "cryptography" },
     { name = "duckdb" },
     { name = "duckdb-engine" },
+    { name = "mypy" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "pyarrow" },
     { name = "pymysql" },
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -704,8 +707,11 @@ dev = [
     { name = "cryptography", specifier = ">=47.0.0" },
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "duckdb-engine", specifier = ">=0.17.0" },
+    { name = "mypy", specifier = ">=1.20.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.3" },
+    { name = "pyarrow", specifier = ">=24.0.0" },
     { name = "pymysql", specifier = ">=1.1.2" },
+    { name = "pytest", specifier = ">=9.0.3" },
 ]
 
 [[package]]
