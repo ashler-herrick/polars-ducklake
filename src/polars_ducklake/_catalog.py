@@ -34,11 +34,17 @@ import threading
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from polars_ducklake._file_query import (
+    PartitionField,
+    build_files_query,
+)
+from polars_ducklake._predicate import _AtomicClause
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -121,21 +127,21 @@ class DeleteFileInfo:
 
 
 @dataclass(frozen=True)
-class FileColumnStat:
-    """Per-file, per-column statistics from ``ducklake_file_column_stats``.
+class CandidateFile:
+    """One data file returned by :meth:`CatalogReader.fetch_candidate_files`.
 
-    ``min_value`` and ``max_value`` are the *raw* VARCHAR forms written by
-    the writer. Coercing them to typed Python values is the predicate
-    pruner's job (it knows the column's logical type).
+    Result of the single CTE-shaped enumeration query: visibility,
+    predicate-pushed stats pruning, identity-partition pruning, and
+    delete-file linkage are all already applied.
     """
 
     data_file_id: int
-    column_id: int
-    min_value: str | None
-    max_value: str | None
-    null_count: int | None
-    value_count: int | None
-    contains_nan: bool | None
+    path: str
+    path_is_relative: bool
+    record_count: int
+    begin_snapshot: int
+    partial_max: int | None
+    delete_files: tuple[DeleteFileInfo, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -624,47 +630,111 @@ class CatalogReader(AbstractContextManager["CatalogReader"]):
             for r in rows
         ]
 
-    def fetch_file_stats(
-        self, *, data_file_ids: list[int], column_ids: list[int]
-    ) -> list[FileColumnStat]:
-        """Fetch min/max/null counts for the given (file, column) pairs.
+    def fetch_partition_spec(
+        self, *, table_id: int, snapshot_id: int
+    ) -> list[PartitionField]:
+        """Load the active partition spec for a table at a snapshot.
 
-        Visibility is established by the caller (``data_file_ids`` should
-        already be filtered to files visible at the read snapshot), so
-        this method does not apply MVCC filters of its own — it's a pure
-        lookup against ``ducklake_file_column_stats``.
+        Joins ``ducklake_partition_info``, ``ducklake_partition_column``,
+        and ``ducklake_column`` so each :class:`PartitionField` carries
+        the user-visible column name and catalog ``column_type`` needed
+        to translate predicates against ``partition_value``.
 
-        Returns an empty list if either input is empty (so callers don't
-        have to special-case "no predicate columns" before calling).
+        Returns ``[]`` for unpartitioned tables. The result is in
+        ``partition_key_index`` order.
         """
-        if not data_file_ids or not column_ids:
-            return []
-        stmt = text(
-            """
-            SELECT data_file_id, column_id, min_value, max_value,
-                   null_count, value_count, contains_nan
-            FROM ducklake_file_column_stats
-            WHERE data_file_id IN :file_ids
-              AND column_id IN :column_ids
-            """
-        ).bindparams(
-            sqlalchemy.bindparam("file_ids", expanding=True),
-            sqlalchemy.bindparam("column_ids", expanding=True),
-        )
         rows = self._active_conn.execute(
-            stmt, {"file_ids": data_file_ids, "column_ids": column_ids}
+            text(
+                f"""
+                SELECT pc.partition_key_index, pc.column_id, pc.transform,
+                       c.column_name, c.column_type
+                FROM ducklake_partition_info pi
+                JOIN ducklake_partition_column pc
+                  ON pc.partition_id = pi.partition_id
+                JOIN ducklake_column c
+                  ON c.column_id = pc.column_id
+                  AND :snapshot_id >= c.begin_snapshot
+                  AND (c.end_snapshot IS NULL OR :snapshot_id < c.end_snapshot)
+                WHERE pi.table_id = :table_id
+                  AND :snapshot_id >= pi.begin_snapshot
+                  AND (pi.end_snapshot IS NULL OR :snapshot_id < pi.end_snapshot)
+                ORDER BY pc.partition_key_index
+                """
+            ),
+            {"table_id": table_id, "snapshot_id": snapshot_id},
         ).all()
         return [
-            FileColumnStat(
-                data_file_id=int(r[0]),
+            PartitionField(
                 column_id=int(r[1]),
-                min_value=str(r[2]) if r[2] is not None else None,
-                max_value=str(r[3]) if r[3] is not None else None,
-                null_count=int(r[4]) if r[4] is not None else None,
-                value_count=int(r[5]) if r[5] is not None else None,
-                contains_nan=bool(r[6]) if r[6] is not None else None,
+                column_name=str(r[3]),
+                column_type=str(r[4]),
+                partition_key_index=int(r[0]),
+                transform=str(r[2]),
             )
             for r in rows
+        ]
+
+    def fetch_candidate_files(
+        self,
+        *,
+        table_id: int,
+        snapshot_id: int,
+        column_meta: dict[str, tuple[int, str]],
+        partition_spec: list[PartitionField],
+        clauses: list[_AtomicClause],
+    ) -> list[CandidateFile]:
+        """Run the single CTE-shaped file-enumeration query.
+
+        Replaces the prior 3-query pattern (data files + delete files +
+        per-file stats). Returns one :class:`CandidateFile` per surviving
+        data file, with all attached delete files grouped on the file.
+        """
+        sql, params = build_files_query(
+            table_id=table_id,
+            snapshot_id=snapshot_id,
+            column_meta=column_meta,
+            partition_spec=partition_spec,
+            clauses=clauses,
+            dialect=self.dialect,
+        )
+        rows = self._active_conn.execute(text(sql), params).all()
+
+        # Group multi-row delete-file results onto their data files,
+        # preserving file_order from the ORDER BY.
+        per_file: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            data_file_id = int(r[0])
+            entry = per_file.get(data_file_id)
+            if entry is None:
+                entry = {
+                    "data_file_id": data_file_id,
+                    "path": str(r[1]),
+                    "path_is_relative": bool(r[2]),
+                    "record_count": int(r[3]) if r[3] is not None else 0,
+                    "begin_snapshot": int(r[4]),
+                    "partial_max": int(r[5]) if r[5] is not None else None,
+                    "delete_files": [],
+                }
+                per_file[data_file_id] = entry
+            if r[6] is not None:
+                entry["delete_files"].append(
+                    DeleteFileInfo(
+                        data_file_id=data_file_id,
+                        path=str(r[6]),
+                        path_is_relative=bool(r[7]),
+                    )
+                )
+        return [
+            CandidateFile(
+                data_file_id=e["data_file_id"],
+                path=e["path"],
+                path_is_relative=e["path_is_relative"],
+                record_count=e["record_count"],
+                begin_snapshot=e["begin_snapshot"],
+                partial_max=e["partial_max"],
+                delete_files=tuple(e["delete_files"]),
+            )
+            for e in per_file.values()
         ]
 
     # -- inlined data + global metadata --------------------------------------
