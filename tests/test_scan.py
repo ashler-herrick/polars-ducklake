@@ -918,3 +918,189 @@ class TestDeleteFiles:
         )
         # Original us rows were id=1 and id=2; pos=1 removed id=2; only id=1 left.
         assert df["id"].to_list() == [1]
+
+
+class TestPartitionPruning:
+    """Identity-partition pushdown: equality on a partition column drops
+    files in non-matching partitions before any Parquet I/O."""
+
+    @staticmethod
+    def _build_partitioned_lake(builder: Any) -> int:
+        """Three files in three identity-partitioned regions: us / eu / apac."""
+        snap = builder.take_snapshot()
+        schema_id = builder.add_schema(name="main", begin_snapshot=snap)
+        table_id = builder.add_table(
+            schema_id=schema_id,
+            name="t",
+            begin_snapshot=snap,
+            columns=[("id", "INTEGER"), ("region", "VARCHAR")],
+        )
+        # column_ids: id=1, region=2.
+        builder.add_partition(
+            table_id=table_id,
+            begin_snapshot=snap,
+            columns=[(2, "identity")],
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [1, 2], "region": ["us", "us"]}),
+            partition_values={0: "us"},
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [3, 4], "region": ["eu", "eu"]}),
+            partition_values={0: "eu"},
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [5, 6], "region": ["apac", "apac"]}),
+            partition_values={0: "apac"},
+        )
+        return table_id
+
+    @staticmethod
+    def _spy_scan_parquet(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        import polars_ducklake.scan as scan_mod
+
+        recorded: list[Any] = []
+        real = scan_mod.pl.scan_parquet
+
+        def spy(path: Any, **kw: Any) -> Any:
+            recorded.append(path)
+            return real(path, **kw)
+
+        monkeypatch.setattr(scan_mod.pl, "scan_parquet", spy)
+        return recorded
+
+    def test_eq_on_partition_column_opens_only_one_file(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._build_partitioned_lake(builder)
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("region") == "eu")
+            .sort("id")
+            .collect()
+        )
+        assert df["region"].to_list() == ["eu", "eu"]
+        # Only the eu file is opened.
+        assert len(recorded) == 1
+
+    def test_no_predicate_returns_all_partitions(self, builder: Any) -> None:
+        self._build_partitioned_lake(builder)
+        df = pdl.scan_ducklake(builder.url, table="t").sort("id").collect()
+        assert df["id"].to_list() == [1, 2, 3, 4, 5, 6]
+
+    def test_predicate_outside_all_partitions_returns_empty(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._build_partitioned_lake(builder)
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("region") == "antarctica")
+            .collect()
+        )
+        assert df.height == 0
+        # No file opened — every partition was excluded by the catalog query.
+        assert len(recorded) == 0
+
+    def test_non_identity_partition_falls_through_to_stats(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Year-transformed partition: not pushed down today, but the
+        # column also has stats so the predicate still prunes by stats.
+        snap = builder.take_snapshot()
+        schema_id = builder.add_schema(name="main", begin_snapshot=snap)
+        table_id = builder.add_table(
+            schema_id=schema_id,
+            name="t",
+            begin_snapshot=snap,
+            columns=[("yr", "INTEGER")],
+        )
+        builder.add_partition(
+            table_id=table_id, begin_snapshot=snap, columns=[(1, "year")]
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"yr": [2023, 2023]}),
+            compute_stats=True,
+            partition_values={0: 2023},
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"yr": [2024, 2024]}),
+            compute_stats=True,
+            partition_values={0: 2024},
+        )
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter(pl.col("yr") == 2024)
+            .collect()
+        )
+        assert df["yr"].to_list() == [2024, 2024]
+        # Stats CTE prunes 2023; only 2024 opened.
+        assert len(recorded) == 1
+
+
+class TestLossyExtraction:
+    """Mixed-AND predicates: supported leaves still prune even when a
+    sibling leaf is something we don't translate (e.g. is_in)."""
+
+    @staticmethod
+    def _spy_scan_parquet(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        import polars_ducklake.scan as scan_mod
+
+        recorded: list[Any] = []
+        real = scan_mod.pl.scan_parquet
+
+        def spy(path: Any, **kw: Any) -> Any:
+            recorded.append(path)
+            return real(path, **kw)
+
+        monkeypatch.setattr(scan_mod.pl, "scan_parquet", spy)
+        return recorded
+
+    def test_supported_leaf_prunes_when_sibling_unsupported(
+        self, builder: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Two files with disjoint id ranges. Predicate is
+        # (id == 175) & (v.is_in([...])). The is_in side is dropped by
+        # extract_clauses; the id == 175 side still prunes the first file.
+        snap = builder.take_snapshot()
+        schema_id = builder.add_schema(name="main", begin_snapshot=snap)
+        table_id = builder.add_table(
+            schema_id=schema_id,
+            name="t",
+            begin_snapshot=snap,
+            columns=[("id", "INTEGER"), ("v", "VARCHAR")],
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [1, 50, 100], "v": ["a", "b", "c"]}),
+            compute_stats=True,
+        )
+        builder.write_data_file(
+            table_id=table_id,
+            begin_snapshot=snap,
+            df=pl.DataFrame({"id": [150, 175, 200], "v": ["d", "e", "f"]}),
+            compute_stats=True,
+        )
+        recorded = self._spy_scan_parquet(monkeypatch)
+        df = (
+            pdl.scan_ducklake(builder.url, table="t")
+            .filter((pl.col("id") == 175) & pl.col("v").is_in(["e"]))
+            .collect()
+        )
+        # Polars applies the full predicate: row id=175, v=e survives.
+        assert df["id"].to_list() == [175]
+        # The supported leaf (id == 175) pruned the first file.
+        assert len(recorded) == 1

@@ -76,6 +76,7 @@ class DuckLakeBuilder:
         self._column_counter = 0
         self._data_file_counter = 0
         self._delete_file_counter = 0
+        self._partition_counter = 0
         # Track each data file's resolved on-disk path so add_delete_file
         # can populate the spec-required (file_path, pos) columns.
         self._data_file_paths: dict[int, Path] = {}
@@ -240,6 +241,34 @@ class DuckLakeBuilder:
                 extra_stats VARCHAR(1024)
             )
             """,
+            # Per the DuckLake spec, partition info is split into a
+            # per-table partition_info row (one per active spec version)
+            # and partition_column rows for each key in the spec. Files
+            # carry their per-key values in file_partition_value.
+            """
+            CREATE TABLE ducklake_partition_info (
+                partition_id BIGINT NOT NULL,
+                table_id BIGINT NOT NULL,
+                begin_snapshot BIGINT NOT NULL,
+                end_snapshot BIGINT
+            )
+            """,
+            """
+            CREATE TABLE ducklake_partition_column (
+                partition_id BIGINT NOT NULL,
+                partition_key_index BIGINT NOT NULL,
+                column_id BIGINT NOT NULL,
+                transform VARCHAR(64) NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE ducklake_file_partition_value (
+                data_file_id BIGINT NOT NULL,
+                table_id BIGINT NOT NULL,
+                partition_key_index BIGINT NOT NULL,
+                partition_value VARCHAR(1024)
+            )
+            """,
             # ``key`` is reserved in MySQL — quote it per-dialect.
             f"""
             CREATE TABLE ducklake_metadata (
@@ -395,6 +424,51 @@ class DuckLakeBuilder:
                 )
         return table_id
 
+    def add_partition(
+        self,
+        *,
+        table_id: int,
+        begin_snapshot: int,
+        columns: list[tuple[int, str]],
+    ) -> int:
+        """Register an identity (or transformed) partition spec for a table.
+
+        ``columns`` is a list of ``(column_id, transform)`` tuples in
+        partition_key_index order. ``transform`` is a string like
+        ``"identity"``, ``"year"``, etc.; the reader/builder only push
+        identity-transform clauses today.
+        """
+        self._partition_counter += 1
+        partition_id = self._partition_counter
+        with self._conn() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO ducklake_partition_info
+                        (partition_id, table_id, begin_snapshot, end_snapshot)
+                    VALUES (:pid, :tid, :begin, NULL)
+                    """
+                ),
+                {"pid": partition_id, "tid": table_id, "begin": begin_snapshot},
+            )
+            for idx, (column_id, transform) in enumerate(columns):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO ducklake_partition_column
+                            (partition_id, partition_key_index, column_id, transform)
+                        VALUES (:pid, :idx, :cid, :tr)
+                        """
+                    ),
+                    {
+                        "pid": partition_id,
+                        "idx": idx,
+                        "cid": column_id,
+                        "tr": transform,
+                    },
+                )
+        return partition_id
+
     def write_data_file(
         self,
         *,
@@ -405,6 +479,7 @@ class DuckLakeBuilder:
         path_is_relative: bool = True,
         partial_max: int | None = None,
         compute_stats: bool = False,
+        partition_values: dict[int, Any] | None = None,
     ) -> int:
         """Write a Parquet data file and register it in ducklake_data_file.
 
@@ -416,6 +491,10 @@ class DuckLakeBuilder:
         with min/max/null counts derived from ``df``. Used for predicate-
         pruning tests; left off by default so existing fixtures stay
         focused on whatever they're testing.
+
+        ``partition_values`` maps ``partition_key_index → Python value``
+        (stringified per the writer's stat-string rules). Required for
+        files in a partitioned table; ignored otherwise.
         """
         self._data_file_counter += 1
         data_file_id = self._data_file_counter
@@ -452,6 +531,25 @@ class DuckLakeBuilder:
             self._populate_file_column_stats(
                 data_file_id=data_file_id, table_id=table_id, df=df
             )
+        if partition_values:
+            with self._conn() as conn:
+                for key_idx, value in partition_values.items():
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO ducklake_file_partition_value
+                                (data_file_id, table_id,
+                                 partition_key_index, partition_value)
+                            VALUES (:dfid, :tid, :idx, :val)
+                            """
+                        ),
+                        {
+                            "dfid": data_file_id,
+                            "tid": table_id,
+                            "idx": key_idx,
+                            "val": _stat_string(value) if value is not None else None,
+                        },
+                    )
         return data_file_id
 
     def _populate_file_column_stats(

@@ -25,9 +25,8 @@ for the plugin contract.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -35,15 +34,14 @@ import polars as pl
 from polars.io.plugins import register_io_source
 
 from polars_ducklake._catalog import (
+    CandidateFile,
     CatalogReader,
     ColumnInfo,
-    DataFileInfo,
-    FileColumnStat,
     SchemaInfo,
     TableInfo,
     _engine_from_metadata_catalog,
 )
-from polars_ducklake._predicate import extract_clauses, file_can_match
+from polars_ducklake._predicate import extract_clauses
 from polars_ducklake.paths import PathSegment, resolve_path
 from polars_ducklake.types import build_nested_type, is_nested_type, map_type
 
@@ -267,7 +265,7 @@ def _plan_file(
     reader: CatalogReader,
     *,
     table_id: int,
-    file: DataFileInfo,
+    file: CandidateFile,
     target_snapshot: int,
     target_columns: list[_TargetColumn],
     full_path: str,
@@ -413,49 +411,18 @@ def _scan_with_deletes(
     )
 
 
-@dataclass(frozen=True)
-class _Resolved:
-    """Cached output of one catalog resolution pass.
-
-    Holds everything the scan needs after the catalog connection has been
-    closed: the user-visible target columns, the per-file plans (paths
-    fully resolved, delete files attached, schema-evolution projections
-    baked in), and the empty/non-empty signal.
-    """
-
-    target_columns: list[_TargetColumn]
-    polars_schema: dict[str, pl.DataType]
-    per_file_plans: list[_FilePlan]
-    has_delete_files: bool
-
-    @property
-    def is_empty(self) -> bool:
-        return not self.per_file_plans
-
-    @property
-    def fast_path_eligible(self) -> bool:
-        """True when every file's schema matches target and no deletes apply.
-
-        Lets us collapse to a single multi-file ``pl.scan_parquet`` so the
-        Polars engine can optimize across files.
-        """
-        return not self.has_delete_files and all(
-            plan.is_pure_passthrough for plan in self.per_file_plans
-        )
-
-
 @dataclass
 class _PlanContext:
     """Lazy bridge between :func:`scan_ducklake`'s arguments and the data
     needed to actually read.
 
     ``snapshot_id`` is required to be already resolved (via
-    :meth:`CatalogReader.resolve_snapshot_id`) — pinning the snapshot at
+    :meth:`CatalogReader.resolve_snapshot`) — pinning the snapshot at
     call time is what makes the resulting LazyFrame reproducible against
-    later catalog commits. All other catalog work (schema/table/columns/
-    files/deletes) is deferred to :meth:`resolve` and memoized so the
-    schema callable and the read generator can both reach for it without
-    paying for it twice.
+    later catalog commits. All deferred catalog work (partition spec,
+    data_path, file enumeration with predicate pushdown, per-file plan
+    construction) runs inside the IO-source generator since file
+    enumeration depends on the predicate Polars hands us at read time.
 
     ``engine`` is the SQLAlchemy ``Engine`` resolved once at scan-build
     time. Storing the engine (rather than the user's original argument)
@@ -472,96 +439,13 @@ class _PlanContext:
     target_columns: list[_TargetColumn]
     storage_options: dict[str, Any] | None
     data_path: str | None
-    _resolved: _Resolved | None = field(default=None, init=False, repr=False)
-
-    def resolve(self, reader: CatalogReader | None = None) -> _Resolved:
-        """Run the deferred catalog phase, optionally on a caller-owned reader.
-
-        When ``reader`` is supplied, all queries run on that connection —
-        the generator passes the reader it already opened so the deferred
-        phase consumes one connection end-to-end. When ``reader`` is
-        ``None`` (e.g. the schema callable invoked outside any generator
-        run), this method opens its own short-lived reader.
-        """
-        if self._resolved is not None:
-            return self._resolved
-        if reader is not None:
-            self._resolved = self._do_resolve(reader)
-            return self._resolved
-        with CatalogReader.from_engine(self.engine) as r:
-            self._resolved = self._do_resolve(r)
-        return self._resolved
-
-    def _do_resolve(self, reader: CatalogReader) -> _Resolved:
-        table_id = self.table_info.table_id
-        target_columns = self.target_columns
-        polars_schema = {tc.name: tc.dtype for tc in target_columns}
-
-        data_files = reader.fetch_data_files(
-            table_id=table_id, snapshot_id=self.snapshot_id
-        )
-        delete_files = reader.fetch_delete_files(
-            table_id=table_id, snapshot_id=self.snapshot_id
-        )
-        effective_data_path = (
-            self.data_path if self.data_path is not None else reader.fetch_data_path()
-        )
-
-        schema_segment = PathSegment(
-            path=self.schema_info.path,
-            is_relative=self.schema_info.path_is_relative,
-        )
-        table_segment = PathSegment(
-            path=self.table_info.path,
-            is_relative=self.table_info.path_is_relative,
-        )
-
-        def _resolve_path(path: str, path_is_relative: bool) -> str:
-            return resolve_path(
-                path=path,
-                path_is_relative=path_is_relative,
-                data_path=effective_data_path,
-                schema_segment=schema_segment,
-                table_segment=table_segment,
-            )
-
-        # Group delete files by the data file they apply to. The catalog
-        # link via data_file_id is authoritative: even if a delete-file
-        # Parquet were to carry rows for multiple data files, the catalog
-        # tells us which data file each catalog row applies to.
-        deletes_by_file: dict[int, list[str]] = defaultdict(list)
-        for df in delete_files:
-            deletes_by_file[df.data_file_id].append(
-                _resolve_path(df.path, df.path_is_relative)
-            )
-
-        per_file_plans = [
-            _plan_file(
-                reader,
-                table_id=table_id,
-                file=f,
-                target_snapshot=self.snapshot_id,
-                target_columns=target_columns,
-                full_path=_resolve_path(f.path, f.path_is_relative),
-                delete_paths=deletes_by_file.get(f.data_file_id, []),
-            )
-            for f in data_files
-        ]
-
-        return _Resolved(
-            target_columns=target_columns,
-            polars_schema=polars_schema,
-            per_file_plans=per_file_plans,
-            has_delete_files=bool(delete_files),
-        )
 
     def _polars_schema(self) -> pl.Schema:
         """Schema callable handed to ``register_io_source``.
 
-        Returns from the eagerly-cached column list — Polars' planner
+        Answers from the eagerly-cached column list — Polars' planner
         invokes this during query optimization and we don't want to open
-        a separate catalog connection just for the schema. File-level
-        work still defers to :meth:`resolve` on the generator's reader.
+        a separate catalog connection just for the schema.
         """
         return pl.Schema({tc.name: tc.dtype for tc in self.target_columns})
 
@@ -602,20 +486,13 @@ def _make_generator(
         n_rows: int | None,
         _batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        # Open one catalog connection for the whole deferred phase: plan
-        # resolution (if not already memoised) and predicate pruning both
-        # run on this reader. The connection stays open across yields and
-        # is released by the context manager when the consumer exhausts
-        # or closes the generator.
+        # One catalog connection for the entire deferred phase: partition
+        # spec, the candidate-file query (with predicate pushdown), and
+        # per-file column lookups for schema evolution. The connection
+        # stays open across yields and is released by the context manager
+        # when the consumer exhausts or closes the generator.
         with CatalogReader.from_engine(ctx.engine) as reader:
-            r = ctx.resolve(reader=reader)
-            plans = r.per_file_plans
-            if predicate is not None:
-                # Catalog-level pruning: drop whole files whose per-column
-                # min/max in the catalog rule out the predicate. Files we
-                # can't decide on (unsupported predicate, missing stats)
-                # fall through and Polars handles the filter itself.
-                plans = _prune_files_by_stats(reader, r, plans, predicate)
+            plans = _build_plans(reader, ctx, predicate)
 
             remaining = n_rows
             for plan in plans:
@@ -641,60 +518,71 @@ def _make_generator(
     return _gen
 
 
-def _prune_files_by_stats(
+def _build_plans(
     reader: CatalogReader,
-    resolved: _Resolved,
-    plans: list[_FilePlan],
-    predicate: pl.Expr,
+    ctx: _PlanContext,
+    predicate: pl.Expr | None,
 ) -> list[_FilePlan]:
-    """Drop files whose catalog stats prove the predicate false.
+    """Run the deferred catalog phase: enumerate candidate files under
+    the predicate, resolve their paths, attach delete files, and bake
+    schema-evolution projections into one :class:`_FilePlan` per file.
 
-    Returns ``plans`` unchanged when:
-
-    * the predicate isn't a flat AND of supported leaves,
-    * none of the leaf columns are visible in the target schema, or
-    * the catalog has no stats rows for the (file, column) pairs we'd
-      check (e.g. the writer didn't emit them).
-
-    Otherwise, fetches stats once for every (referenced column, file)
-    pair and runs :func:`file_can_match` per file.
-
-    ``reader`` is the deferred-phase reader opened by the generator —
-    we share the same connection rather than opening a third one.
+    File enumeration uses the single CTE-shaped query from
+    :mod:`polars_ducklake._file_query`: predicate clauses translate to
+    per-column stats CTEs and identity-partition CTEs, so pruning
+    happens catalog-side in one round trip.
     """
-    clauses = extract_clauses(predicate)
-    if not clauses:
-        return plans
+    table_id = ctx.table_info.table_id
 
-    # Map predicate column names → (column_id, column_type) at the target.
-    target_meta: dict[str, tuple[int, str]] = {
-        tc.name: (tc.column_id, tc.column_type) for tc in resolved.target_columns
-    }
-    referenced_column_ids = {
-        target_meta[c.column][0] for c in clauses if c.column in target_meta
-    }
-    if not referenced_column_ids:
-        # Predicate references only columns that don't exist at the target
-        # snapshot (likely a user mistake — Polars will raise at collect).
-        return plans
-
-    file_ids = [p.data_file_id for p in plans]
-    stats = reader.fetch_file_stats(
-        data_file_ids=file_ids,
-        column_ids=sorted(referenced_column_ids),
+    partition_spec = reader.fetch_partition_spec(
+        table_id=table_id, snapshot_id=ctx.snapshot_id
+    )
+    effective_data_path = (
+        ctx.data_path if ctx.data_path is not None else reader.fetch_data_path()
     )
 
-    # Group stats by data_file_id for the per-file check.
-    by_file: dict[int, dict[int, FileColumnStat]] = defaultdict(dict)
-    for s in stats:
-        by_file[s.data_file_id][s.column_id] = s
+    clauses = extract_clauses(predicate) if predicate is not None else []
+    column_meta: dict[str, tuple[int, str]] = {
+        tc.name: (tc.column_id, tc.column_type) for tc in ctx.target_columns
+    }
+    candidates = reader.fetch_candidate_files(
+        table_id=table_id,
+        snapshot_id=ctx.snapshot_id,
+        column_meta=column_meta,
+        partition_spec=partition_spec,
+        clauses=clauses,
+    )
+
+    schema_segment = PathSegment(
+        path=ctx.schema_info.path,
+        is_relative=ctx.schema_info.path_is_relative,
+    )
+    table_segment = PathSegment(
+        path=ctx.table_info.path,
+        is_relative=ctx.table_info.path_is_relative,
+    )
+
+    def _resolve_path(path: str, path_is_relative: bool) -> str:
+        return resolve_path(
+            path=path,
+            path_is_relative=path_is_relative,
+            data_path=effective_data_path,
+            schema_segment=schema_segment,
+            table_segment=table_segment,
+        )
 
     return [
-        p
-        for p in plans
-        if file_can_match(
-            stats_by_column=by_file.get(p.data_file_id, {}),
-            clauses=clauses,
-            column_meta=target_meta,
+        _plan_file(
+            reader,
+            table_id=table_id,
+            file=cand,
+            target_snapshot=ctx.snapshot_id,
+            target_columns=ctx.target_columns,
+            full_path=_resolve_path(cand.path, cand.path_is_relative),
+            delete_paths=[
+                _resolve_path(d.path, d.path_is_relative)
+                for d in cand.delete_files
+            ],
         )
+        for cand in candidates
     ]
