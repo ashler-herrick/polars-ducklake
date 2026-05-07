@@ -20,6 +20,7 @@ import json
 import platform
 import statistics
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -30,11 +31,20 @@ from polars_ducklake._catalog import _engine_from_metadata_catalog
 from bench.fixtures import BenchLake
 from bench.instrumentation import count_catalog_activity
 from bench.runners import RunResult
-from bench.runners import duckdb_runner, polars_ducklake_runner
+from bench.runners import (
+    ducklake_polars_runner,
+    duckdb_runner,
+    polars_ducklake_runner,
+)
 from bench.workloads import Workload
 
 
-READERS = ("polars_ducklake", "duckdb_arrow_only", "duckdb_arrow_to_polars")
+READERS = (
+    "polars_ducklake",
+    "ducklake_polars",
+    "duckdb_arrow_only",
+    "duckdb_arrow_to_polars",
+)
 WARMUP_REPS = 1
 TIMED_REPS = 5
 
@@ -131,6 +141,30 @@ def _time_polars_ducklake(
     return samples_ms, last
 
 
+def _time_ducklake_polars(
+    lake: BenchLake, workload: Workload
+) -> tuple[list[float], RunResult]:
+    """Time the rival ducklake-polars reader.
+
+    Unlike :func:`_time_polars_ducklake`, this reader does not go
+    through our SQLAlchemy engine, so there is nothing to instrument:
+    ``conn_count`` and ``metadata_query_count`` come back as ``None``,
+    same as the DuckDB readers.
+    """
+    for _ in range(WARMUP_REPS):
+        ducklake_polars_runner.run(lake, workload)
+
+    samples_ms: list[float] = []
+    last: RunResult | None = None
+    for _ in range(TIMED_REPS):
+        t0 = time.perf_counter()
+        res = ducklake_polars_runner.run(lake, workload)
+        samples_ms.append((time.perf_counter() - t0) * 1000.0)
+        last = res
+    assert last is not None
+    return samples_ms, last
+
+
 def _time_duckdb(
     lake: BenchLake,
     workload: Workload,
@@ -169,10 +203,27 @@ def run_bench(
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     rows: list[MeasurementRow] = []
+    skipped_ducklake_polars_reason: str | None = None
     for workload in workloads:
         for reader in readers:
             if reader == "polars_ducklake":
                 samples, result = _time_polars_ducklake(lake, workload)
+            elif reader == "ducklake_polars":
+                if skipped_ducklake_polars_reason is not None:
+                    continue
+                try:
+                    samples, result = _time_ducklake_polars(lake, workload)
+                except ValueError as exc:
+                    # The rival package raises ValueError when it does
+                    # not understand the catalog version (e.g. v1.0 vs
+                    # the 0.3 it supports). Skip every remaining
+                    # ducklake_polars cell and surface the reason once.
+                    skipped_ducklake_polars_reason = str(exc)
+                    print(
+                        f"  ducklake_polars: skipped — {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
             elif reader == "duckdb_arrow_only":
                 samples, result = _time_duckdb(lake, workload, mode="arrow_only")
             elif reader == "duckdb_arrow_to_polars":

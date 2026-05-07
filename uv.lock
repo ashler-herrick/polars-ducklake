@@ -360,6 +360,18 @@ wheels = [
 ]
 
 [[package]]
+name = "ducklake-polars"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "polars" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/91/fe/59a359eace404749924d2fd6aed4a0a959424a4cddf53a0b07583636594a/ducklake_polars-0.1.1.tar.gz", hash = "sha256:cc052bcd1e48f9438ed99444d39f720d0105d60b41774685acf701fcc4146e88", size = 117837 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/41/04a00b68dcd857ca1c555fe069d07e74f9727c3a19ef64b2dc07ab0d6dd6/ducklake_polars-0.1.1-py3-none-any.whl", hash = "sha256:3071031c764aaa01f0fae32159ac82beba3bac8343b0cffc41cb6e0bd8d88483", size = 56717 },
+]
+
+[[package]]
 name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -648,7 +660,7 @@ wheels = [
 
 [[package]]
 name = "polars-ducklake"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "polars" },
@@ -679,6 +691,7 @@ dev = [
     { name = "cryptography" },
     { name = "duckdb" },
     { name = "duckdb-engine" },
+    { name = "ducklake-polars" },
     { name = "mypy" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyarrow" },
@@ -707,6 +720,7 @@ dev = [
     { name = "cryptography", specifier = ">=47.0.0" },
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "duckdb-engine", specifier = ">=0.17.0" },
+    { name = "ducklake-polars", specifier = ">=0.1.1" },
     { name = "mypy", specifier = ">=1.20.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.3" },
     { name = "pyarrow", specifier = ">=24.0.0" },

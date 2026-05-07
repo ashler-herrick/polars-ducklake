@@ -69,7 +69,13 @@ becomes a footgun).
 
 ## Readers
 
-- `polars_ducklake` — `scan_ducklake(...).collect()` straight to Polars.
+- `polars_ducklake` — this project: `scan_ducklake(...).collect()` straight to Polars.
+- `ducklake_polars` — the rival pure-Python reader on PyPI (different
+  author, similar idea). Wired in via the same `scan_ducklake(...).collect()`
+  pattern, with API translation (raw catalog path instead of SQLAlchemy
+  URL, `snapshot_version=` instead of `snapshot_id=`, no
+  `storage_options`). See "Comparing against `ducklake-polars`" below
+  for current limitations.
 - `duckdb_arrow_only` — DuckDB ducklake extension materializing a pyarrow Table (no Polars hop).
 - `duckdb_arrow_to_polars` — DuckDB → arrow → `pl.from_arrow`. The natural apples-to-apples comparison.
 
@@ -108,6 +114,37 @@ catalog engine). For DuckDB readers they are reported as `null`.
   under `host_fingerprint`. Don't compare medians across hosts.
 
 This is a "way off base?" signal, not a regression gate.
+
+## Comparing against `ducklake-polars`
+
+There is a separate, similarly-named package on PyPI —
+[`ducklake-polars`](https://pypi.org/project/ducklake-polars/) (by a
+different author) — that pursues the same goal: read DuckLake tables
+into Polars without DuckDB at runtime. The bench harness wires it in
+as a fourth reader so we can measure both side-by-side.
+
+**Today, a head-to-head wallclock comparison on the bench lake is not
+possible.** The reason is a non-overlapping spec-version matrix:
+
+| Component                       | DuckLake spec it speaks |
+|---------------------------------|--------------------------|
+| `polars-ducklake` (this project)| v1.0 only (uses the `partial_max` column added in v1.0) |
+| `ducklake-polars` 0.1.1 (rival) | v0.3 only (rejects v1.0 with `Unsupported DuckLake catalog version '1.0'`) |
+| DuckDB 1.3.x ducklake extension | writes v0.2 catalogs |
+| DuckDB 1.4.x ducklake extension | writes v0.3 catalogs (and has a `CHECKPOINT` binder bug on the v0.3 metadata) |
+| DuckDB 1.5.2+ ducklake extension| writes v1.0 catalogs |
+
+There is no DuckDB version that produces a catalog both readers
+accept, so the bench harness emits a single skip message and proceeds
+with the other three readers when the lake is v1.0. The skip is
+preserved in the runner code so a future ducklake-polars release that
+adopts v1.0 will light up the comparison automatically.
+
+If you want to drive the rival writer directly (rather than the
+DuckDB-extension-managed seed), add a paradigm-3 fixture using
+`ducklake_polars.write_ducklake` — but that is testing the rival
+end-to-end, not the read path against canonical DuckDB-extension
+output, which is the question the harness is built around.
 
 ## Two test paradigms in this repo
 
